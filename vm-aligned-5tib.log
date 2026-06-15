@@ -1,0 +1,115 @@
+Enable succeeded: 
+[stdout]
+e=3979 IOPS @ 277.1 us
+
+--- iter 2 ---
+  iter=2  read=11910 IOPS @ 241.2 us   write=3991 IOPS @ 278.2 us
+
+--- iter 3 ---
+  iter=3  read=11890 IOPS @ 242.0 us   write=3985 IOPS @ 277.6 us
+
+Test 3a summary saved to /tmp/followup-results/vm-aligned-z1-nconnect8-3a.txt
+iter,read_iops,read_lat_us,write_iops,write_lat_us
+1,11873,242.6,3979,277.1
+2,11910,241.2,3991,278.2
+3,11890,242.0,3985,277.6
+
+##########  Test 3b - Iodepth sweep  ##########
+
+--- iodepth=1 ---
+  iodepth=1     read=11805 IOPS @ 244.1 us   write=3956 IOPS @ 278.3 us
+
+--- iodepth=4 ---
+  iodepth=4     read=11718 IOPS @ 245.4 us   write=3928 IOPS @ 282.1 us
+
+--- iodepth=16 ---
+  iodepth=16    read=11443 IOPS @ 251.5 us   write=3832 IOPS @ 288.4 us
+
+--- iodepth=64 ---
+  iodepth=64    read=11679 IOPS @ 246.5 us   write=3914 IOPS @ 282.1 us
+
+--- iodepth=256 ---
+  iodepth=256   read=11520 IOPS @ 249.3 us   write=3860 IOPS @ 288.0 us
+
+Test 3b summary saved to /tmp/followup-results/vm-aligned-z1-nconnect8-3b.txt
+iodepth,read_iops,read_lat_us,write_iops,write_lat_us
+1,11805,244.1,3956,278.3
+4,11718,245.4,3928,282.1
+16,11443,251.5,3832,288.4
+64,11679,246.5,3914,282.1
+256,11520,249.3,3860,288.0
+
+==========================================================
+  Done on vm-aligned (zone 1, nconnect=8)
+  All raw JSON in /tmp/followup-results
+==========================================================
+
+==================================================================
+=== 5 TiB run @ nconnect=16
+==================================================================
+==========================================================
+  Follow-up test on vm-aligned (zone 1, nconnect=16)
+  2026-06-15T11:01:18Z
+==========================================================
+==> Unmounting existing /mnt/netapp
+==> Mounting /mnt/netapp with nconnect=16
+10.50.2.4:/vol1 on /mnt/netapp type nfs4 (rw,relatime,vers=4.1,rsize=262144,wsize=262144,namlen=255,hard,fatal_neterrors=none,proto=tcp,nconnect=16,timeo=600,retrans=2,sec=sys,clientaddr=10.50.1.5,local_lock=none,addr=10.50.2.4)
+
+
+##########  Test 3a - Repeatability (iodepth=64, 4 jobs, 30 s, x3)  ##########
+
+--- iter 1 ---
+  iter=1  read=11203 IOPS @ 257.5 us   write=3748 IOPS @ 293.2 us
+
+--- iter 2 ---
+  iter=2  read=11695 IOPS @ 246.7 us   write=3920 IOPS @ 280.2 us
+
+--- iter 3 ---
+  iter=3  read=11576 IOPS @ 248.4 us   write=3879 IOPS @ 285.4 us
+
+Test 3a summary saved to /tmp/followup-results/vm-aligned-z1-nconnect16-3a.txt
+iter,read_iops,read_lat_us,write_iops,write_lat_us
+1,11203,257.5,3748,293.2
+2,11695,246.7,3920,280.2
+3,11576,248.4,3879,285.4
+
+##########  Test 3b - Iodepth sweep  ##########
+
+--- iodepth=1 ---
+  iodepth=1     read=11600 IOPS @ 248.1 us   write=3888 IOPS @ 284.2 us
+
+--- iodepth=4 ---
+  iodepth=4     read=11472 IOPS @ 251.2 us   write=3844 IOPS @ 286.5 us
+
+--- iodepth=16 ---
+  iodepth=16    read=11657 IOPS @ 247.1 us   write=3907 IOPS @ 282.1 us
+
+--- iodepth=64 ---
+  iodepth=64    read=11658 IOPS @ 247.0 us   write=3908 IOPS @ 282.3 us
+
+--- iodepth=256 ---
+  iodepth=256   read=11633 IOPS @ 248.3 us   write=3898 IOPS @ 280.8 us
+
+Test 3b summary saved to /tmp/followup-results/vm-aligned-z1-nconnect16-3b.txt
+iodepth,read_iops,read_lat_us,write_iops,write_lat_us
+1,11600,248.1,3888,284.2
+4,11472,251.2,3844,286.5
+16,11657,247.1,3907,282.1
+64,11658,247.0,3908,282.3
+256,11633,248.3,3898,280.8
+
+==========================================================
+  Done on vm-aligned (zone 1, nconnect=16)
+  All raw JSON in /tmp/followup-results
+==========================================================
+
+==================================================================
+=== Summary of 5 TiB result files
+==================================================================
+-rw-r--r-- 1 root root 126 Jun 15 11:03 /tmp/followup-results/5tib-vm-aligned-z1-nconnect16-3a.txt
+-rw-r--r-- 1 root root 183 Jun 15 11:07 /tmp/followup-results/5tib-vm-aligned-z1-nconnect16-3b.txt
+-rw-r--r-- 1 root root 126 Jun 15 10:57 /tmp/followup-results/5tib-vm-aligned-z1-nconnect8-3a.txt
+-rw-r--r-- 1 root root 183 Jun 15 11:01 /tmp/followup-results/5tib-vm-aligned-z1-nconnect8-3b.txt
+
+[stderr]
+

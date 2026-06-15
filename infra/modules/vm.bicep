@@ -1,4 +1,4 @@
-// Single Linux VM with public IP, zone-pinned, Ubuntu 22.04 LTS.
+// Single Linux VM with public IP, zone-pinned, Ubuntu 24.04 LTS.
 @description('VM name')
 param name string
 

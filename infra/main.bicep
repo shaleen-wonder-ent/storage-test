@@ -130,6 +130,13 @@ resource anfSubnet 'Microsoft.Network/virtualNetworks/subnets@2024-01-01' existi
 }
 
 // ---------- Azure Files: SMB ----------
+// NOTE: `allowSharedKeyAccess: true` is the *requested* property value, but
+// many enterprise tenants enforce `allowSharedKeyAccess=false` via Azure
+// Policy. The deployment still succeeds (policy can override storage-account
+// properties post-create), and `setup-vm.sh` treats SMB mount failure as
+// non-fatal so the NFS tests still run. The reference findings in
+// Storage-CrossZone-Findings.md were captured in such a tenant — SMB is
+// excluded there. Same-protocol NFS-vs-NFS is the cleaner comparison anyway.
 resource smbAccount 'Microsoft.Storage/storageAccounts@2024-01-01' = {
   name: smbAccountName
   location: location

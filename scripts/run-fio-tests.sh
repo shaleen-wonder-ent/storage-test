@@ -50,12 +50,22 @@ run_sustained() {
 echo "##########  BURST TEST (75/25 randrw, 4k, iodepth=64, size=1M)  ##########"
 for entry in "${MOUNTS[@]}"; do
     label=${entry%=*}; path=${entry#*=}
+    if ! mountpoint -q "$path"; then
+        echo "--- [$label] SKIPPED ($path is not mounted)"
+        echo
+        continue
+    fi
     run_burst "$label" "$path"
 done
 
 echo "##########  SUSTAINED 60s TEST  ##########"
 for entry in "${MOUNTS[@]}"; do
     label=${entry%=*}; path=${entry#*=}
+    if ! mountpoint -q "$path"; then
+        echo "--- [$label] SKIPPED ($path is not mounted)"
+        echo
+        continue
+    fi
     run_sustained "$label" "$path"
 done
 

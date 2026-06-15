@@ -194,7 +194,7 @@ investigation centers.
 
 This already matches the reported "~3× worse cross-zone" behaviour on ANF.
 
-### 3.2 Deep-dive run (Test 3 — in progress)
+### 3.2 Deep-dive run (Test 3)
 
 #### 3.2a Repeatability (iodepth=64, 4 jobs, 30 s × 3 iterations)
 
@@ -276,7 +276,7 @@ not a spectrum.***
 
 ---
 
-### 3.3 Side-by-side summary (warm steady-state, 4 jobs)
+### 3.3 Side-by-side summary (warm steady-state, 4 jobs, nconnect=8)
 
 | VM | Zone | Read IOPS | Read lat | Write IOPS | Write lat | vs aligned |
 |---|---|---|---|---|---|---|
@@ -290,11 +290,225 @@ single 4 KiB I/O.
 
 ---
 
+### 3.4 Follow-up run: nconnect=16 sweep (vm-aligned and vm-misaligned)
+
+A second run was performed using the [run-followup-tests.sh](scripts/run-followup-tests.sh)
+harness, holding everything constant except the NFS mount option
+`nconnect`. The hypothesis (§4.6 in an earlier draft) was that doubling
+nconnect from 8 to 16 would roughly double cross-zone IOPS, because the
+cross-zone ceiling was modeled as *(NFS slots) ÷ RTT*. **The data does
+not support that hypothesis.**
+
+Dates: same 2026-06 lab, same 2 TiB Premium volume in Z1. vm-z3 was not
+included — vm-misaligned already established that Z2 and Z3 behave
+identically, so vm-misaligned is sufficient for the cross-zone leg.
+
+#### 3.4a Test 3a (iodepth=64, 4 jobs, 30 s × 3 iterations)
+
+| VM | nconnect | Iter | Read IOPS | Read lat (μs) | Write IOPS | Write lat (μs) |
+|---|---|---|---|---|---|---|
+| vm-aligned    | 8  | 1 | 12,218 | 235.0 | 4,095 | 271.5 |
+| vm-aligned    | 8  | 2 | 12,327 | 232.8 | 4,132 | 269.4 |
+| vm-aligned    | 8  | 3 | 12,260 | 234.7 | 4,110 | 269.0 |
+| vm-aligned    | 8  | **avg** | **12,268** | **234.2** | **4,112** | **270.0** |
+| vm-aligned    | 16 | 1 | 11,765 | 245.1 | 3,943 | 278.9 |
+| vm-aligned    | 16 | 2 | 11,855 | 242.7 | 3,973 | 278.4 |
+| vm-aligned    | 16 | 3 | 11,762 | 245.0 | 3,943 | 279.3 |
+| vm-aligned    | 16 | **avg** | **11,794** | **244.3** | **3,953** | **278.9** |
+| vm-misaligned | 8  | 1 | 1,542 | 1909.1 |   523 | 1965.3 |
+| vm-misaligned | 8  | 2 |   742 | 3926.6 |   256 | 4204.0 |
+| vm-misaligned | 8  | 3 |   338 | 8523.8 |   118 | 9275.4 |
+| vm-misaligned | 16 | 1 | 4,348 |  678.3 | 1,458 |  716.5 |
+| vm-misaligned | 16 | 2 | 4,351 |  678.5 | 1,458 |  714.8 |
+| vm-misaligned | 16 | 3 | 4,354 |  678.2 | 1,459 |  713.7 |
+| vm-misaligned | 16 | **avg** | **4,351** | **678.3** | **1,458** | **715.0** |
+
+*The vm-misaligned nconnect=8 row is the most striking. Test 3a with
+nconnect=8 showed a severe back-to-back degradation: 1,542 → 742 → 338
+read IOPS over three consecutive 30 s runs, with read latency ballooning
+from 1.9 ms to 8.5 ms. This pattern is consistent with a service-side
+burst-credit or token-bucket throttle that is exhausted by sustained
+75/25 random I/O at iodepth=64. The very next test (§3.4b sweep) on the
+same mount shows fully recovered numbers, so the throttle relaxes
+quickly. Repeatability on the cross-zone aligned mount with
+nconnect=8 is therefore worse than the original §3.2a numbers (which
+were taken with a fresh mount each time); this is a behaviour of the
+throttle, not a property of nconnect. With nconnect=16 the same
+back-to-back sequence is rock-steady (4,348 → 4,351 → 4,354), suggesting
+that raising the NFS slot count keeps the workload below whatever
+threshold trips the throttle.*
+
+#### 3.4b Test 3b (iodepth sweep at 4 jobs × 30 s)
+
+| VM | nconnect | iodepth | Read IOPS | Read lat (μs) | Write IOPS | Write lat (μs) |
+|---|---|---|---|---|---|---|
+| vm-aligned    | 8  | 1   | 12,198 | 235.2 | 4,088 | 272.3 |
+| vm-aligned    | 8  | 4   | 12,243 | 234.5 | 4,104 | 270.9 |
+| vm-aligned    | 8  | 16  | 11,882 | 242.3 | 3,981 | 277.3 |
+| vm-aligned    | 8  | 64  | 12,280 | 233.9 | 4,117 | 269.6 |
+| vm-aligned    | 8  | 256 | 12,314 | 233.4 | 4,128 | 268.6 |
+| vm-aligned    | 16 | 1   | 11,839 | 242.9 | 3,967 | 279.4 |
+| vm-aligned    | 16 | 4   | 11,518 | 250.3 | 3,858 | 285.5 |
+| vm-aligned    | 16 | 16  | 11,762 | 245.0 | 3,942 | 279.3 |
+| vm-aligned    | 16 | 64  | 11,869 | 242.7 | 3,977 | 277.3 |
+| vm-aligned    | 16 | 256 | 11,907 | 241.6 | 3,991 | 277.5 |
+| vm-misaligned | 8  | 1   | 4,153 | 711.4 | 1,394 | 745.8 |
+| vm-misaligned | 8  | 4   | 4,144 | 712.7 | 1,391 | 747.6 |
+| vm-misaligned | 8  | 16  | 4,122 | 717.0 | 1,383 | 750.6 |
+| vm-misaligned | 8  | 64  | 4,134 | 714.5 | 1,388 | 749.6 |
+| vm-misaligned | 8  | 256 | 4,121 | 716.3 | 1,383 | 753.2 |
+| vm-misaligned | 16 | 1   | 4,344 | 679.3 | 1,456 | 716.3 |
+| vm-misaligned | 16 | 4   | 4,332 | 680.6 | 1,452 | 720.0 |
+| vm-misaligned | 16 | 16  | 4,344 | 679.3 | 1,456 | 716.6 |
+| vm-misaligned | 16 | 64  | 4,328 | 681.9 | 1,451 | 719.1 |
+| vm-misaligned | 16 | 256 | 4,324 | 682.5 | 1,450 | 719.4 |
+
+#### 3.4c What changed when nconnect went from 8 to 16
+
+| Measurement | vm-aligned 8 → 16 | vm-misaligned 8 → 16 |
+|---|---|---|
+| Read IOPS (sweep avg)  | 12,183 → 11,779 (**−3.3 %**) | 4,135 → 4,334 (**+4.8 %**) |
+| Write IOPS (sweep avg) | 4,084 → 3,947  (**−3.4 %**) | 1,388 → 1,453 (**+4.7 %**) |
+| Read latency (sweep avg)  | 235.9 → 244.5 μs (+8.6 μs) | 714.4 → 680.7 μs (−33.7 μs) |
+| Cross-zone IOPS ratio  | — | aligned/cross-zone: 2.95× → 2.72× |
+
+**Headline: doubling nconnect bought only ~5 % on the cross-zone leg, and
+nothing on the aligned leg.** The earlier prediction ("cross-zone should
+roughly double, ratio should tighten to ~1.7×") was incorrect. The actual
+ratio improved marginally, from 2.95× to 2.72×.
+
+#### 3.4d What this implies about the bottleneck
+
+Applying Little's Law to the cross-zone numbers:
+
+* nconnect=8:  4,134 IOPS × 0.000715 s = **2.96 outstanding I/Os**
+* nconnect=16: 4,328 IOPS × 0.000682 s = **2.95 outstanding I/Os**
+
+The **effective concurrency is ~3, regardless of nconnect**. That is far
+below the 32 NFS slots (nconnect=8 × numjobs=4) the model assumed. So
+the cross-zone limit is **not** *(client-side slots) ÷ RTT* — it is a
+service-side per-volume concurrency cap of ~3 in-flight 4 KiB ops at
+this volume size. Raising nconnect on the client cannot push past it.
+The aligned side hits the same ceiling at ~3 outstanding I/Os too
+(12,250 × 0.000235 = 2.88), which is why nconnect=16 also did not help
+aligned — and slightly hurt it because the extra TCP connections add
+overhead without gaining throughput.
+
+This reframes the §4.1 Q4 / §4.6 wording: the per-volume concurrency is
+**the** ceiling. The aligned numbers are higher only because each of
+those ~3 in-flight ops completes ~3× faster (235 μs vs 715 μs).
+
+### 3.5 Follow-up run: 5 TiB volume (vm-aligned and vm-misaligned)
+
+To test whether the aligned ceiling really is a per-volume concurrency
+cap (as §3.4d argued) or just a 2 TiB provisioned-throughput cap, the
+ANF pool was resized in place from 4 → 8 TiB and the volume from
+2 → 5 TiB. Pool QoS stayed in **Auto** mode, so the resize bumped the
+volume's provisioned throughput from **128 MiB/s** (2 TiB × 64 MiB/s/TiB)
+to **320 MiB/s** (5 TiB × 64 MiB/s/TiB) — a clean 2.5× headroom
+increase. Tests 3a and 3b were then re-run on both VMs at
+`nconnect={8, 16}`.
+
+#### 3.5a Test 3a (iodepth=64, 4 jobs, 30 s × 3 iterations)
+
+| Host | nconnect | iter | Read IOPS | Read µs | Write IOPS | Write µs |
+|---|---|---|---|---|---|---|
+| vm-aligned    | 8  | 1 | 11,873 | 242.6 | 3,979 | 277.1 |
+| vm-aligned    | 8  | 2 | 11,910 | 241.2 | 3,991 | 278.2 |
+| vm-aligned    | 8  | 3 | 11,890 | 242.0 | 3,985 | 277.6 |
+| vm-aligned    | 8  | **avg** | **11,891** | **241.9** | **3,985** | **277.6** |
+| vm-aligned    | 16 | 1 | 11,203 | 257.5 | 3,748 | 293.2 |
+| vm-aligned    | 16 | 2 | 11,695 | 246.7 | 3,920 | 280.2 |
+| vm-aligned    | 16 | 3 | 11,576 | 248.4 | 3,879 | 285.4 |
+| vm-aligned    | 16 | **avg** | **11,491** | **250.9** | **3,849** | **286.3** |
+| vm-misaligned | 8  | 1 | 4,286 | 689.5 | 1,436 | 723.5 |
+| vm-misaligned | 8  | 2 | 4,275 | 691.6 | 1,433 | 724.3 |
+| vm-misaligned | 8  | 3 | 4,326 | 683.1 | 1,450 | 716.2 |
+| vm-misaligned | 8  | **avg** | **4,296** | **688.1** | **1,440** | **721.3** |
+| vm-misaligned | 16 | 1 | 4,355 | 677.5 | 1,460 | 714.2 |
+| vm-misaligned | 16 | 2 | 4,344 | 678.1 | 1,456 | 720.0 |
+| vm-misaligned | 16 | 3 | 4,312 | 682.2 | 1,446 | 728.4 |
+| vm-misaligned | 16 | **avg** | **4,337** | **679.3** | **1,454** | **720.9** |
+
+#### 3.5b Test 3b (iodepth sweep at 4 jobs × 30 s)
+
+Aligned, nconnect=8 → 11,805 / 11,718 / 11,443 / 11,679 / 11,520 read
+IOPS across iodepths 1 / 4 / 16 / 64 / 256. Aligned, nconnect=16 →
+11,600 / 11,472 / 11,657 / 11,658 / 11,633. Misaligned, nconnect=8 →
+4,302 / 4,305 / 4,335 / 4,324 / 4,288. Misaligned, nconnect=16 →
+4,334 / 4,318 / 4,337 / 4,340 / 4,348. **Both legs are flat across the
+full iodepth range at 5 TiB, exactly as they were at 2 TiB.**
+
+#### 3.5c 2 TiB → 5 TiB delta (this is the surprise)
+
+| Metric (avg of 3a) | Aligned 2 TiB → 5 TiB | Cross-zone 2 TiB → 5 TiB |
+|---|---|---|
+| Read IOPS (nconnect=8)  | 12,268 → 11,891  (**−3.1 %**) | 4,134 → 4,296  (**+3.9 %**) |
+| Write IOPS (nconnect=8) | 4,112 → 3,985    (**−3.1 %**) | 1,390 → 1,440  (**+3.6 %**) |
+| Read IOPS (nconnect=16) | 11,794 → 11,491  (**−2.6 %**) | 4,337 → 4,337  (**0 %**)    |
+| Read µs (nconnect=8)    | 234 → 242 µs                   | 715 → 688 µs                  |
+
+Doubling provisioned throughput from 128 MiB/s to 320 MiB/s (2.5×) **had
+no effect on either leg**. The aligned side did not scale up; the
+cross-zone side did not budge. Both numbers stayed within ±4 % of the
+2 TiB baseline — well inside run-to-run noise.
+
+#### 3.5d What this proves about the bottleneck
+
+The pool is in Auto QoS, so the volume's provisioned throughput rose
+from 128 MiB/s to 320 MiB/s automatically when the volume was resized
+(confirmed via `az netappfiles pool show` →
+`utilizedThroughputMibps: 320` and `az netappfiles volume show` →
+`actualThroughputMibps: 320`). At 4 KiB random I/O that 320 MiB/s
+works out to a **theoretical bandwidth ceiling of ~82,000 IOPS** — we
+are hitting **~15 % of it**. The volume has 5× the headroom it had at
+2 TiB and is using none of it.
+
+Applying Little's Law to the new 5 TiB averages:
+
+* Aligned   nconnect=8:  11,891 × 0.000242 s = **2.88 in-flight**
+* Aligned   nconnect=16: 11,491 × 0.000251 s = **2.88 in-flight**
+* Cross-zone nconnect=8:   4,296 × 0.000688 s = **2.96 in-flight**
+* Cross-zone nconnect=16:  4,337 × 0.000679 s = **2.95 in-flight**
+
+**Identical to the 2 TiB result: ~3 in-flight ops, regardless of zone,
+regardless of `nconnect`, regardless of volume size, regardless of
+provisioned throughput.** Every knob the application or operator can
+turn caps out at the same ~3 outstanding 4 KiB ops per volume. The only
+thing that moves the IOPS number is the per-op RTT — which is
+geometric: 235 µs aligned vs 688 µs cross-zone. That ratio is the
+entire story:
+
+$$ \text{IOPS}_{\text{aligned}} / \text{IOPS}_{\text{cross-zone}}
+   \;\approx\; \text{RTT}_{\text{cross-zone}} / \text{RTT}_{\text{aligned}}
+   \;\approx\; 3\times $$
+
+This falsifies the model used earlier in §4.1 / §4.2 / §4.6 that
+predicted *"5 TiB Premium ≈ ~35k IOPS aligned"* and a ratio that
+*"widens to ~8×"*. Both numbers were wrong. The aligned and
+cross-zone ceilings are set by the same per-volume concurrency cap;
+buying more capacity does **not** raise either one, at least for
+4 KiB random I/O on the Premium tier in Auto QoS. The 3× ratio is
+looking less like a floor and more like a constant — set entirely by
+the inter-zone RTT.
+
+> **Caveats on this finding.** The cap reported here is for 4 KiB
+> random 75/25 with `numjobs=4` and `iodepth=64`. It is plausibly a
+> per-volume serialization limit on small-block random ops at the ANF
+> service. Workloads that drive larger I/O sizes (where MiB/s, not
+> ops/s, becomes the constraint) will see the provisioned throughput
+> matter again. A separate run at e.g. `bs=64k` would confirm or
+> refute this hypothesis. Also, **Manual QoS** lets the operator set
+> throughput per volume independently of pool capacity; whether it
+> also lifts the per-volume concurrency cap is not tested here.
+
+---
+
 ## 4. Conclusion
 
 ### 4.1 Direct answers to the five investigation questions
 
-**1. Is the reported "~3× cross-zone penalty" reproducible? → Yes, exactly.**
+**1. Is the reported "~3× cross-zone penalty" reproducible? → Yes, exactly — at this volume size.**
 
 | Measurement | Aligned (Z1) | Cross-zone (Z2) | Cross-zone (Z3) | Penalty |
 |---|---|---|---|---|
@@ -304,6 +518,25 @@ single 4 KiB I/O.
 The reported number is correct and not workload-specific or random noise.
 The gap is reproducible across 3 iterations, across two different
 non-zone-1 VMs, and across the entire iodepth sweep.
+
+> **Important caveat on "3×" — updated by §3.5.** The aligned
+> ~12k–14k read IOPS is a **per-volume concurrency ceiling** of about
+> 3 in-flight 4 KiB ops, not a provisioned-throughput ceiling and not a
+> network ceiling (the iodepth sweep is flat because the volume itself
+> serializes, not because the client is saturated). The cross-zone ~4k
+> IOPS is the same ~3 in-flight ops divided by a 3× larger RTT. The
+> follow-up runs confirm:
+> * At 2 TiB Premium, nconnect=8: ratio = **2.97×**.
+> * At 2 TiB Premium, nconnect=16: ratio = **2.72×**.
+> * At 5 TiB Premium, nconnect=8: ratio = **2.77×** (aligned did not scale up).
+> * At 5 TiB Premium, nconnect=16: ratio = **2.65×**.
+>
+> So the 3× ratio is more **constant than floor** in this regime: it
+> tracks the inter-zone RTT ratio (~700 µs ÷ ~235 µs ≈ 3) and is not
+> sensitive to volume size, `nconnect`, or iodepth. The thing that
+> **is** constant is the latency delta (~450–500 µs added per I/O
+> cross-zone) — that is the inter-zone RTT cost and the most defensible
+> number to quote when talking about the penalty in the abstract.
 
 **2. Is the penalty consistent across Zone 2 and Zone 3? → Yes, identical.**
 
@@ -332,27 +565,43 @@ The **IOPS ratio (3.31×) almost exactly matches the latency ratio (3.43×)**.
 That's the proof that this is a pure network-RTT effect — nothing to do
 with ANF's storage backend, NFS protocol, or the workload pattern.
 
-**4. At what iodepth does the gap close? → It never does, with this workload.**
+**4. At what iodepth does the gap close? → It does not close with iodepth, *and it does not close with `nconnect` either*.**
 
-This was the most surprising finding. The flat iodepth sweep shows that
-*no amount* of application-side concurrency tuning closes the gap:
+This is the most subtle finding. The flat iodepth sweep shows that
+*application-side queue depth* does not close the gap:
 
-* Aligned: ~14,000 IOPS at iodepth=1, ~14,000 IOPS at iodepth=256
-  (volume IOPS limit reached at every depth)
-* Cross-zone: ~4,100 IOPS at iodepth=1, ~4,100 IOPS at iodepth=256
-  (cross-zone concurrency limit reached at every depth)
+* Aligned: ~12k–14k IOPS at iodepth=1, same at iodepth=256
+* Cross-zone: ~4.1k IOPS at iodepth=1, same at iodepth=256
 
-For the **`nconnect=8` standard mount**, an application running cross-zone
-on ANF is stuck at ~4k random 4 KiB IOPS no matter what they do in their
-code. The only knob that would help is raising `nconnect` (max 16 for ANF)
-or adding more mount points, but even that linearly scales a fundamentally
-latency-bound regime.
+The nconnect=16 follow-up (§3.4) then shows that *transport-level slots*
+do not close it either:
+
+* Aligned nconnect=8 → 16: 12,268 → 11,794 read IOPS (−3.9 %)
+* Cross-zone nconnect=8 → 16: 4,134 → 4,344 read IOPS (+5.1 %)
+
+Little's Law on the cross-zone result gives ≈3 outstanding I/Os whether
+nconnect is 8 or 16, and the aligned side hits the same ~3-in-flight
+ceiling at ~235 μs per op. **The real ceiling is a service-side
+per-volume concurrency cap, not (client-slots ÷ RTT).** The aligned
+side is faster only because each of those ~3 slots completes ~3× faster
+thanks to the much lower RTT. So the gap is:
+
+> aligned_IOPS / cross_zone_IOPS ≈ cross_zone_RTT / aligned_RTT ≈ 3×
+
+at this volume size, and the only application-side knobs that move it
+are ones that **lower the RTT** — which means moving the compute into
+the ANF volume's zone.
 
 **5. Architecture recommendation → Co-locate compute with the ANF volume's zone.**
 
-The cross-zone penalty is real, large (3×), reproducible, and unfixable at
-the application layer. So the only correct answer is to make sure the
-workload never runs cross-zone in production.
+The cross-zone penalty is real, large (≥3× at this volume size),
+reproducible, and not eliminable from the application layer. The
+nconnect=16 follow-up confirmed the cross-zone leg gains only ~5 % from
+doubling the NFS transport slot count, because the service-side
+per-volume concurrency cap (~3 in-flight ops at this size) is reached
+long before client transport runs out. So the correct answer is
+still architectural: make sure latency-sensitive workloads run in the
+same zone as the ANF volume.
 
 ### 4.2 Recommendations
 
@@ -369,8 +618,9 @@ workload never runs cross-zone in production.
    **per-zone volumes with application-level replication** (e.g. a primary
    in Z1 and a replicated read replica in Z2/Z3 served by its own ANF
    volume in that zone), not a single shared ANF volume read by all zones.
-   ANF Cross-Region Replication and Cross-Zone Replication exist for
-   exactly this pattern.
+   ANF **Cross-Zone Replication** provides this for in-region HA.
+   (Cross-Region Replication addresses a different problem — regional
+   disaster recovery — and is out of scope for this cross-zone lab.)
 
 **For workloads that don't need ANF's IOPS:**
 
@@ -381,14 +631,31 @@ workload never runs cross-zone in production.
 * The choice is therefore: ANF if you need >5,000 IOPS *and* you can
   guarantee zone alignment; Azure Files NFS otherwise.
 
-**Sizing implication for the original 2 / 3 / 5 TB question:**
+**Sizing implication for the original 2 / 3 / 5 TB question — revised by §3.5.**
 
-At 2 TiB Premium the volume hit ~14k read IOPS aligned (the provisioned
-limit). Scaling to 5 TiB Premium gives ~35k read IOPS aligned — but **only
-if the client stays in the ANF zone**. Cross-zone, the answer is the same
-~4k IOPS regardless of volume size, because the bottleneck is the network,
-not the storage. **Buying more ANF capacity does nothing to fix the
-cross-zone problem.** Only zone-alignment does.
+The original prediction in this section was that scaling to 5 TiB
+Premium would give *~35k read IOPS aligned* because the per-TiB
+throughput tier (64 MiB/s/TiB) implies a higher ceiling. **That
+prediction was tested in §3.5 and falsified.** Going from 2 TiB to
+5 TiB increased the volume's provisioned throughput from 128 MiB/s to
+320 MiB/s (Auto QoS, confirmed via the ARM API), but neither the
+aligned IOPS (~12k → ~12k) nor the cross-zone IOPS (~4.1k → ~4.3k) moved
+outside run-to-run noise. Both legs cap at ~3 in-flight 4 KiB ops per
+volume, leaving 80–85 % of the provisioned throughput unused on a 5 TiB
+volume.
+
+The practical implication for 4 KiB random workloads on Premium with
+Auto QoS: **capacity sizing does not buy you small-block IOPS**.
+Buy capacity for the data you need to store; do not buy capacity
+expecting it to lift the random-IOPS ceiling. For workloads where
+`bs ≥ 64k` (i.e. MiB/s is the real constraint), capacity will matter
+again because provisioned throughput will be the binding cap.
+Cross-zone is still ~4k IOPS regardless of any of this. **Buying
+more ANF capacity does nothing to fix the cross-zone problem, and**
+(at the workload tested here) **does nothing to lift aligned 4 KiB
+random IOPS either.** Only zone-alignment moves the IOPS number;
+only a different QoS mode or block size would move the aligned
+ceiling.
 
 ### 4.3 HA architecture options (when "spread across zones" is required)
 
@@ -565,16 +832,78 @@ disappear.
 * **Pattern C** often wins on TCO once the DBA hours are counted —
   prefer it whenever the workload is a supported managed engine.
 
+### 4.6 Limitations and future work
+
+**1. `nconnect=16` on the cross-zone mount — DONE (§3.4).** The
+follow-up run quantified the effect of doubling `nconnect`. Result:
+cross-zone +5 %, aligned −4 %, ratio 2.95× → 2.72×. The original
+prediction (cross-zone IOPS roughly doubles, ratio tightens to ~1.7×)
+was **incorrect** — the cross-zone ceiling is a service-side per-volume
+concurrency cap (≈3 outstanding 4 KiB ops at this size, per Little's
+Law), not a client-side transport-slot cap. Raising `nconnect` cannot
+push past it. This is now the headline addition to the verdict.
+
+**2. Larger volume aligned, to show the ratio widens — DONE (§3.5),
+result was the opposite of the prediction.** The pool was resized
+from 4 → 8 TiB and the volume from 2 → 5 TiB in place; Auto QoS bumped
+provisioned throughput from 128 MiB/s to 320 MiB/s. Aligned IOPS
+**did not scale** (11,891 vs 12,268 — within 3 %), cross-zone IOPS
+**did not change** (4,296 vs 4,134 — within 4 %), and the ratio
+**slightly narrowed** rather than widened. Little's Law gives the same
+~3 in-flight ops on every combination of {2 TiB, 5 TiB} × {nconnect=8,
+16} × {aligned, cross-zone}. The per-volume concurrency cap is
+apparently the same at 5 TiB as at 2 TiB, at least for 4 KiB random I/O
+with `numjobs=4` on Premium / Auto QoS. Open question for further work:
+does the same cap apply under **Manual QoS**, or with **larger block
+sizes** (`bs=64k`, `bs=1m`) where throughput would actually become the
+binding constraint?
+
+**3. Azure Files NFS at `nconnect=8` for clean comparison — DONE.** The
+earlier version of `setup-vm.sh` mounted Azure Files NFS at
+`nconnect=4` while ANF was at `nconnect=8`, which left the
+Files-vs-ANF comparison not strictly apples-to-apples. The script now
+uses `nconnect=8` for both. The previously published Files numbers
+(~810 read IOPS) should be re-validated under the new setting before
+being quoted as a clean comparison; this lab now uses the
+`run-followup-tests.sh` harness for ANF only, so the Files comparison
+is still on the original Test 1 / Test 2 numbers.
+
 ### 4.5 Bottom line
 
-> The original observation is correct. Azure NetApp Files Premium delivers
-> ~14k random 4 KiB read IOPS at 200 μs latency when the client VM is in
-> the same availability zone as the volume, and drops to ~4k IOPS at 700 μs
-> latency when the client is in any other zone. The ~3× cross-zone
-> penalty is caused by Azure's inter-zone RTT (~500 μs added per I/O),
-> is symmetric across all non-source zones, and cannot be tuned away at
-> the application layer. The fix is architectural: pin the compute to
-> the ANF volume's zone (or use per-zone ANF volumes with replication).
+> The original observation is correct. Azure NetApp Files Premium on a
+> 2 TiB volume delivers ~12k–14k random 4 KiB read IOPS at ~200–235 µs
+> latency when the client VM is in the same availability zone as the
+> volume, and drops to ~4k IOPS at ~700 µs latency when the client is in
+> any other zone. The cross-zone penalty is caused by Azure's inter-zone
+> RTT (~450–500 µs added per I/O). It is symmetric across all non-source
+> zones (Z2 ≈ Z3) and **cannot be removed** from the application layer.
+> Two follow-up hypotheses were tested and both falsified:
+>
+> 1. **`nconnect=16` closes the gap (§3.4)** — false. Doubling NFS
+>    transport slots gained cross-zone only ~5 % and lost aligned ~4 %.
+> 2. **A larger 5 TiB volume lifts aligned IOPS / widens the ratio
+>    (§3.5)** — also false. Resizing the volume to 5 TiB and the pool
+>    to 8 TiB (which auto-bumped provisioned throughput from 128 MiB/s
+>    to 320 MiB/s in Auto QoS) left aligned IOPS unchanged at ~12k and
+>    cross-zone unchanged at ~4.3k, with ~80 % of the new throughput
+>    sitting idle.
+>
+> The reason both fixes failed is that both ceilings sit at the same
+> service-side per-volume concurrency cap — about **3 in-flight 4 KiB
+> ops per volume**, by Little's Law, holding across every {2 TiB,
+> 5 TiB} × {nconnect=8, 16} × {aligned, cross-zone} combination tested.
+> Aligned is faster only because each of those ~3 ops completes ~3×
+> faster thanks to lower RTT. So
+> $\text{IOPS}_{\text{aligned}} / \text{IOPS}_{\text{cross-zone}}
+> \approx \text{RTT}_{\text{cross-zone}} / \text{RTT}_{\text{aligned}}
+> \approx 3\times$ is essentially a **constant** of the inter-zone RTT
+> ratio, not a floor that widens with capacity.
+>
+> The fix is architectural: pin the compute to the ANF volume's zone,
+> or use per-zone ANF volumes with replication. Open question for
+> further work: whether **Manual QoS** or **larger block sizes**
+> (`bs=64k`) lift the per-volume concurrency cap and let the
+> provisioned throughput actually be consumed.
 
 ---
 

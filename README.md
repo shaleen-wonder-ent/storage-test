@@ -12,18 +12,34 @@ Shares under test (all mounted into the same VM):
 
 | Mount point      | Backend                 |
 |------------------|-------------------------|
-| `/mnt/fileshare` | Azure Files **SMB** (Premium) |
+| `/mnt/fileshare` | Azure Files **SMB** (Premium) — *may be blocked by tenant policy; see note below* |
 | `/mnt/nfsshare`  | Azure Files **NFS** (Premium) |
 | `/mnt/netapp`    | Azure NetApp Files **NFS** (Premium, zonal) |
 
-Two VMs are deployed:
+> **SMB note.** The Bicep deploys an SMB-enabled FileStorage account, but if
+> your tenant enforces `allowSharedKeyAccess=false` via Azure Policy (common
+> in enterprise tenants), the SMB mount in `setup-vm.sh` is skipped at runtime
+> and SMB is omitted from the results. The reference findings
+> ([Storage-CrossZone-Findings.md](Storage-CrossZone-Findings.md)) were
+> captured in such a tenant, so they cover **NFS only** (Azure Files NFS and
+> ANF). Same-protocol (NFS-vs-NFS) is cleaner anyway for the zone-affinity
+> question.
+
+Two VMs are deployed by the Bicep:
 
 | VM            | Zone | Purpose |
 |---------------|------|---------|
 | `vm-aligned`     | 1 (same zone as ANF) | "Best case" — aligned-node test |
 | `vm-misaligned`  | 2 (different zone)   | "Worst case" — cross-zone test |
 
-You run the **same `fio` commands** on both VMs and compare.
+> **Three-VM variant.** The reference findings additionally use a `vm-z3` in
+> Zone 3 to prove the cross-zone penalty is symmetric (i.e. Zone 1 → Zone 2
+> ≈ Zone 1 → Zone 3, not one bad zone pair). That third VM was added ad-hoc
+> for the published run; the Bicep here deploys the minimum 2-VM topology.
+> To reproduce the symmetry result, deploy a third `Standard_D8s_v5` in Zone
+> 3 in the same `vm-subnet` and run the same fio commands against it.
+
+You run the **same `fio` commands** on every VM and compare.
 
 ---
 
@@ -108,7 +124,7 @@ What it does:
      ANF subnet delegated to `Microsoft.NetApp/volumes`).
    - NSG allowing SSH only from `SshSourceAddressPrefix`.
    - Two Linux VMs (`vm-aligned` in zone 1, `vm-misaligned` in zone 2),
-     Ubuntu 22.04 LTS, `Standard_D8s_v5`.
+     Ubuntu 24.04 LTS, `Standard_D8s_v5`.
    - Two Premium **FileStorage** accounts — one with an SMB share, one with
      an NFS share, both locked down to the VNet.
    - An ANF account, capacity pool (4 TiB Premium), and 2 TiB NFSv4.1 volume
@@ -143,9 +159,10 @@ After it runs, verify on each VM:
 
 ```bash
 df -hT | grep -E 'cifs|nfs'
-# /mnt/fileshare  cifs    100G   ...
 # /mnt/nfsshare   nfs4    100G   ...
 # /mnt/netapp     nfs4    2.0T   ...
+# /mnt/fileshare  cifs    100G   ...   <- only if SMB mount succeeded
+#                                         (often blocked by tenant policy)
 ```
 
 ---
@@ -158,11 +175,13 @@ It also runs an optional sustained 60-second version so you can see
 steady-state behaviour (the `--size=1M` burst test alone does not).
 
 ```powershell
-# Aligned VM (expect ~3000-3500 read IOPS / ~1000-1200 write IOPS on ANF)
+# Aligned VM — expect ~13,000-14,000 read / ~4,500-4,700 write IOPS on ANF
+# (sustained, 4 jobs, iodepth=64, against a 2 TiB Premium volume — see note
+# below; numbers scale with volume size).
 ssh -i $HOME\.ssh\anf_lab azureuser@$($out.alignedVmIp) `
     "bash /tmp/run-fio-tests.sh" | Tee-Object .\results-aligned.txt
 
-# Misaligned VM (expect ~1/3 of the above on ANF)
+# Misaligned VM — expect ~3-4x lower on ANF (~4,200 read / ~1,400 write)
 ssh -i $HOME\.ssh\anf_lab azureuser@$($out.misalignedVmIp) `
     "bash /tmp/run-fio-tests.sh" | Tee-Object .\results-misaligned.txt
 ```
@@ -182,16 +201,41 @@ better reflects real database I/O.
 
 ### What you should see
 
-| Workload                | Aligned VM (zone 1)        | Misaligned VM (zone 2)     |
-|-------------------------|----------------------------|----------------------------|
-| Azure Files **SMB**     | ~250–350 read / ~80–110 write IOPS | ~250–350 / ~80–110 (similar) |
-| Azure Files **NFS**     | ~260–340 read / ~85–110 write IOPS | ~260–340 / ~85–110 (similar) |
-| Azure NetApp Files NFS  | **~3000–3500 read / ~1000–1200 write IOPS** | ~800–1100 read / ~270–330 write IOPS (~⅓) |
+Measured on the reference run (sustained test: 4 jobs × iodepth=64, 60 s, 4 KiB
+random 75/25, 2 TiB Premium ANF volume):
+
+| Workload                | Aligned VM (zone 1)         | Misaligned VM (zone 2)         |
+|-------------------------|-----------------------------|--------------------------------|
+| Azure Files **NFS**     | ~810 read / ~273 write IOPS | ~812 read / ~274 write IOPS *(zone-insensitive)* |
+| Azure NetApp Files NFS  | **~13,900 read / ~4,670 write IOPS** | ~4,210 read / ~1,415 write IOPS *(~3.3× slower)* |
+
+SMB on Azure Files is omitted — see the SMB note in §0 above.
 
 The headline finding should reproduce: **only ANF gives a big IOPS jump,
 and only when the client VM is in the same zone as the ANF volume.** Azure
 Files is roughly zone-insensitive at this size because the share itself
 isn't zone-pinned the same way.
+
+> **Two caveats on the absolute ANF numbers:**
+> 1. The aligned ~12k read IOPS is a **per-volume concurrency ceiling**,
+>    not the throughput tier ceiling. It corresponds to ~3 in-flight 4 KiB
+>    ops by Little's Law (~12k × 235 µs ≈ 3). **Resizing the volume to
+>    5 TiB Premium did not lift it.** The follow-up in
+>    [Storage-CrossZone-Findings.md §3.5](Storage-CrossZone-Findings.md)
+>    bumped the pool to 8 TiB and the volume to 5 TiB (Auto QoS pushed
+>    provisioned throughput from 128 MiB/s to 320 MiB/s, confirmed via the
+>    ARM API), but aligned IOPS stayed at ~12k and cross-zone stayed at
+>    ~4.3k — both within run-to-run noise. About 80 % of the new
+>    throughput sat idle. The 3× cross-zone ratio is therefore best
+>    treated as a **constant** of the inter-zone RTT ratio, not a floor
+>    that widens with capacity. The latency *delta* (~450–500 µs added
+>    per I/O cross-zone) is the most defensible number to quote.
+> 2. **`nconnect=16` was tested — it does not close the gap.** See
+>    [Storage-CrossZone-Findings.md §3.4](Storage-CrossZone-Findings.md):
+>    doubling `nconnect` gave cross-zone +5 % and aligned −4 %. Both legs
+>    saturate at ~3 outstanding ops regardless of NFS transport slots, so
+>    the aligned-vs-cross-zone ratio (~3×) is set by inter-zone RTT ratio,
+>    not by client-side concurrency. Zone alignment is the only fix.
 
 ---
 
@@ -208,11 +252,24 @@ different volume size:
     -AnfPoolSizeTiB 8
 ```
 
-ANF throughput on the **Premium** tier scales at 64 MiB/s per TiB, so
-the larger the volume the more headroom the test has. For the 4 KiB
-random-mix `fio` workload used here, IOPS does not scale 1:1 with capacity
-once you're past the burst — that's why the sustained test in the script
-is useful for the sizing decision.
+ANF throughput on the **Premium** tier scales at 64 MiB/s per TiB. **But**
+for the 4 KiB random workload used here, the reference findings
+([§3.5](Storage-CrossZone-Findings.md)) show that resizing 2 TiB → 5 TiB
+(provisioned throughput 128 → 320 MiB/s in Auto QoS) did **not** lift
+either the aligned (~12k) or cross-zone (~4.3k) IOPS — both legs cap at
+about 3 in-flight ops per volume regardless of capacity. Capacity
+sizing buys MiB/s for larger I/O sizes, not small-block random IOPS.
+The sustained test in `run-fio-tests.sh` makes this visible immediately
+after the resize. If you do want to compare different volume sizes,
+the easiest path is to **resize the existing pool/volume in place**
+(no redeploy needed):
+
+```powershell
+az netappfiles pool   update -g rg-storage-iops-lab --account-name iopslab-anf --name pool1 --size 8
+az netappfiles volume update -g rg-storage-iops-lab --account-name iopslab-anf --pool-name pool1 --name vol1 --usage-threshold 5120
+```
+
+(`--usage-threshold` is in GiB on the CLI: 5120 GiB = 5 TiB.)
 
 ---
 
@@ -235,16 +292,18 @@ This deletes the resource group and everything in it.
 ## File layout
 
 ```
-storage-iops-test/
+HCL-StorageTest/
 ├── README.md
 ├── Storage-CrossZone-Findings.md   # full lab report from one run
 ├── infra/
 │   ├── main.bicep              # full lab infra (VNet, VMs, Files, ANF)
 │   ├── main.parameters.json    # template parameters
 │   ├── deploy.ps1              # Windows deployment
-│   └── deploy.sh               # bash deployment
+│   ├── deploy.sh               # bash deployment
+│   └── modules/
+│       └── vm.bicep            # per-VM module (NIC, OS disk, public IP)
 └── scripts/
-    ├── setup-vm.sh             # installs tools + mounts 3 shares
+    ├── setup-vm.sh             # installs tools + mounts NFS shares
     ├── run-fio-tests.sh        # standard fio + sustained variant
     ├── cleanup.ps1
     └── cleanup.sh
