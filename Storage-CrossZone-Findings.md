@@ -1,4 +1,4 @@
-how# Azure Shared Storage IOPS — Cross-Zone Investigation
+# Azure Shared Storage IOPS — Cross-Zone Investigation
 
 **Purpose:** Reproduce and quantify the cross-availability-zone behaviour
 of **Azure NetApp Files (ANF)** and compare it against **Azure Files (NFS)**,
@@ -15,63 +15,137 @@ the client VM is not in the same zone as the ANF volume"*.
 
 ---
 
-## 0. Summary for the Product Group (read this first)
+## Summary
 
-This section is the 2-minute version for the Azure Storage PG. The detailed
-data, methodology, and analysis are in sections 1–4 below.
-
-### 0.1 Why we ran this
-
-HCL Software reported that **Azure NetApp Files (ANF) loses ~3× IOPS on a
+The customer reported that **Azure NetApp Files loses ~3× IOPS on a
 small-block (4 KiB) random workload the moment the client is not in the same
 availability zone as the ANF volume**, while Azure Files showed no such
-zone-sensitivity. We (Microsoft, working alongside HCL) built an independent
-lab to **reproduce and quantify** that claim before bringing it to the PG.
+zone-sensitivity. We built an independent lab to **reproduce and quantify**
+that claim. The headline: the penalty is **real but regime-specific** — it
+hits synchronous / shallow-queue workloads and disappears entirely under
+asynchronous / deep-queue I/O.
 
-### 0.2 What we did
+### What we did (with commands)
 
-* Built a clean, isolated lab in `westus3`: identical `Standard_D8s_v5` Linux
-  VMs in **Zone 1, Zone 2, and Zone 3**, all hitting **one ANF volume pinned
-  to Zone 1** plus an Azure Files NFS share (regional endpoint).
-* Mounted the **same three storage backends** HCL uses (Azure Files SMB,
-  Azure Files NFS, ANF NFS) and ran the **exact fio command HCL ran** —
-  4 KiB, 75/25 random read/write, `direct=1`, `iodepth=64`, `size=1M`.
-* Went beyond HCL's single burst test: added a 60 s **sustained** run, a
-  **3× repeatability** pass, an **iodepth sweep** (1→256), an **`nconnect`
-  sweep** (8 vs 16), and a **volume-resize** test (2 TiB → 5 TiB), capturing
-  fio mean latency throughout.
+* Built a clean, isolated lab in `westus3`: three identical `Standard_D8s_v5`
+  Linux VMs in **Zone 1, Zone 2, and Zone 3**, all hitting **one ANF volume
+  pinned to Zone 1** plus an Azure Files NFS share (regional endpoint). This
+  isolates the **network path to storage** as the only variable.
+* Mounted the storage backends the customer uses (Azure Files SMB, Azure Files
+  NFS, ANF NFS) with identical NFS mount options on every VM:
 
-### 0.3 What we saw
+  ```
+  vers=4.1,sec=sys,nconnect=8,rsize=262144,wsize=262144,hard,timeo=600,retrans=2
+  ```
+
+* **Ran the exact fio command the customer ran** — 4 KiB, 75/25 random
+  read/write, `direct=1`, `iodepth=64`, `size=1M` (burst test):
+
+  ```bash
+  fio --randrepeat=1 --direct=1 --gtod_reduce=1 --name=test \
+      --filename=/mnt/<share>/storage/rrw.fio \
+      --bs=4k --iodepth=64 --size=1M \
+      --readwrite=randrw --rwmixread=75
+  ```
+
+* Added a 60 s **sustained** run with parallel workers (the number to quote for
+  production sizing):
+
+  ```bash
+  fio --randrepeat=1 --direct=1 --name=test \
+      --filename=/mnt/<share>/storage/rrw.fio \
+      --bs=4k --iodepth=64 --size=4G --runtime=60 --time_based \
+      --numjobs=4 --group_reporting \
+      --readwrite=randrw --rwmixread=75
+  ```
+
+* Went beyond the original test with a **3× repeatability** pass, an **iodepth
+  sweep** (1 → 256), an **`nconnect` sweep** (8 vs 16), and a **volume-resize**
+  test (2 TiB → 5 TiB), capturing fio mean latency throughout.
+* **Added an asynchronous variant** using `--ioengine=libaio` so that
+  `iodepth=64` keeps all 64 ops genuinely in flight (256 outstanding with
+  `numjobs=4`), to be fully same-to-same with the customer's async figures:
+
+  ```bash
+  fio --randrepeat=1 --direct=1 --name=test --ioengine=libaio \
+      --filename=/mnt/<share>/storage/rrw.fio \
+      --bs=4k --iodepth=64 --size=4G --runtime=60 --time_based \
+      --numjobs=4 --group_reporting \
+      --readwrite=randrw --rwmixread=75
+  ```
+
+* All execution went through `az vm run-command invoke` because tenant Azure
+  Policy blocks inbound SSH.
+
+### What we saw (sync **and** async)
+
+**Synchronous regime (`psync`, fio default — shallow queue, ~3 ops in flight):**
 
 | Backend | Aligned (client in ANF's zone) | Cross-zone (client in another zone) | Zone sensitivity |
 |---|---|---|---|
 | **ANF** (Premium NFSv4.1) | **~13,900 read / ~4,670 write IOPS**, ~205 µs | **~4,200 read / ~1,415 write IOPS**, ~700 µs | **~3.3× drop** ❌ |
 | **Azure Files NFS** (Premium) | ~810 read / ~273 write IOPS | ~812 read / ~274 write IOPS | none ✅ |
 
-* **HCL's core claim reproduces exactly.** ANF read IOPS drop **3.31× (Z1→Z2)**
-  and **3.39× (Z1→Z3)**. Azure Files is zone-insensitive (<1% delta).
+* The customer's core claim **reproduces exactly**: ANF read IOPS drop
+  **3.31× (Z1→Z2)** and **3.39× (Z1→Z3)**. Azure Files is zone-insensitive
+  (<1 % delta).
 * The penalty is a **pure inter-zone network-RTT effect**: cross-zone adds a
-  **constant ~500 µs per 4 KiB I/O** (205 µs → 700 µs). The IOPS ratio tracks
-  the RTT ratio almost exactly.
-* The penalty is **symmetric** — Zone 2 and Zone 3 behave identically. There
-  is no "good" or "bad" zone pair; "cross-zone" is binary.
-* Within the **synchronous (psync)** regime, two application-side fixes both
-  failed: doubling `nconnect` (8→16) bought only ~5% cross-zone; resizing the
-  volume 2 TiB→5 TiB (provisioned throughput 128→320 MiB/s, Auto QoS) moved
-  nothing. Both legs cap at **~3 in-flight 4 KiB ops per volume** (Little's
-  Law), so within this regime **only zone alignment moves the number.**
-* **But the penalty is regime-specific — newest run (§3.6).** Re-running with an
-  **asynchronous** engine (`--ioengine=libaio`, 256 ops in flight) **erased the
-  ANF cross-zone penalty entirely**: ~24,700 read / ~8,300 write IOPS from
-  *both* Z1 and Z2, identical latency (~7.7 ms). Deep-queue async I/O is bound
-  by the volume's **provisioned throughput** (~128 MiB/s on 2 TiB — we hit it
-  exactly), which is zone-independent, so the ~500 µs RTT becomes noise. The
-  3× penalty is therefore a property of **synchronous / shallow-queue**
-  workloads, not of ANF cross-zone access in general.
+  **constant ~500 µs per 4 KiB I/O** (205 µs → 700 µs).
+* It is **symmetric** — Zone 2 and Zone 3 behave identically. "Cross-zone" is
+  binary; there is no good or bad zone pair.
+* Two application-side fixes both **failed**: doubling `nconnect` (8→16) bought
+  only ~5 % cross-zone; resizing the volume 2 TiB→5 TiB (provisioned throughput
+  128→320 MiB/s, Auto QoS) moved nothing. Both legs cap at **~3 in-flight
+  4 KiB ops per volume** (Little's Law).
 
-### 0.4 Did we test the same thing HCL tested? (same-to-same check)
+**Asynchronous regime (`libaio` — deep queue, 256 ops in flight):**
 
-| Dimension | HCL Software (customer) | Our lab (Microsoft) | Same? |
+| Backend | Engine | Aligned (Z1) read / write IOPS | Cross-zone (Z2) read / write IOPS | Cross-zone penalty |
+|---|---|---|---|---|
+| **ANF** | psync  | 11,200 / 3,752 | 4,509 / 1,506 | **2.48× / 2.49×** |
+| **ANF** | **libaio** | **24,700 / 8,275** | **24,700 / 8,279** | **1.00× (none)** |
+| Azure Files NFS | psync  | 715 / 242 | 645 / 219 | ~1.1× (noise) |
+| Azure Files NFS | libaio | 6,407 / 2,147 | 7,787 / 2,604 | none (zone-insensitive) |
+
+* Switching to async **erased the ANF cross-zone penalty entirely**: ~24,700
+  read / ~8,300 write IOPS from *both* Z1 and Z2, identical ~7.7 ms latency.
+* Under a deep queue, ANF is bound by the volume's **provisioned throughput**
+  (it hit 96.5 MiB/s read + 32.3 MiB/s write ≈ 128 MiB/s — exactly the 2 TiB
+  Premium ceiling), which is **zone-independent**, so the ~500 µs RTT becomes
+  noise.
+* **Azure Files NFS was never zone-sensitive** in either regime — its
+  regional endpoint isn't pinned to a zone, so there was no penalty to erase.
+
+### What it infers
+
+* **The ~3× cross-zone penalty is real, but regime-specific.** It is a property
+  of **synchronous / shallow-queue** 4 KiB workloads (latency / per-op
+  inter-zone-RTT bound), *not* of ANF cross-zone access in general.
+* **No application-side knob removes it in the sync regime.** `nconnect`,
+  iodepth, and capacity / provisioned throughput all leave the cross-zone
+  number at ~4k IOPS, because the volume serializes at ~3 in-flight 4 KiB ops
+  and only the per-op RTT moves the result. The defensible constant to quote is
+  the **~450–500 µs added latency per cross-zone I/O**.
+* **Async deep-queue I/O removes it** by shifting the bottleneck from per-op RTT
+  to the volume's zone-independent provisioned-throughput ceiling. Both zones
+  saturate the same ceiling.
+* **The right question for any workload is which regime it runs in.** If it is
+  sync / latency-bound (e.g. single-threaded synchronous commits), **zone-align
+  the compute** with the ANF volume. If it is async / throughput-bound, the zone
+  does not matter for IOPS.
+* **Azure Files NFS** is a simpler, zone-insensitive choice for small,
+  latency-tolerant shared file workloads — at a much lower absolute ceiling
+  (~810 read IOPS sync).
+
+> **One-line takeaway:** *We independently reproduced the customer's finding with
+> a key nuance. ANF's ~3× cross-zone penalty is real but regime-specific: it hits
+> synchronous / shallow-queue 4 KiB workloads, and `nconnect`, iodepth, and
+> capacity can't tune it away — but asynchronous deep-queue I/O erases it, because
+> both zones saturate the same zone-independent provisioned-throughput ceiling.*
+
+### Same-to-same check (did we test what the customer tested?)
+
+| Dimension | Customer | Our lab | Same? |
 |---|---|---|---|
 | Tool | FIO | FIO | ✅ |
 | Workload | 4 KiB, 75/25 randrw, `size=1M`, `direct=1`, `iodepth=64` | **Identical command** | ✅ |
@@ -83,43 +157,41 @@ lab to **reproduce and quantify** that claim before bringing it to the PG.
 
 **Two methodology differences to keep in mind:**
 
-1. **Parallel-in-one-pod vs isolated runs.** HCL drives all three mounts
-   simultaneously from a single pod; we ran each backend in isolation. This is
-   the main reason HCL's *absolute* ANF numbers (~3,300 read / 1,100 write
-   aligned) are ~4× lower than ours (~13,900 / 4,670) — shared pod CPU/network
-   and concurrent I/O contention. **Crucially, the ~3× cross-zone *ratio* is
-   identical in both labs**, which is the finding that matters. HCL's aligned
-   numbers land near *our* cross-zone numbers because effective concurrency,
-   not the zone, sets the absolute ceiling.
-
-2. **I/O engine — now closed (§3.6).** HCL's support-engineering data splits
-   results by `libaio` (async) vs `psync`/`posixaio` (sync), showing async
-   reaches multi-thousand IOPS on ANF and sync collapses to a few hundred to
-   ~1,500. Our §1–§3.5 runs used fio's default `psync` engine (synchronous,
+1. **Parallel-in-one-pod vs isolated runs.** The customer drives all three
+   mounts simultaneously from a single pod; we ran each backend in isolation.
+   This is the main reason the customer's *absolute* ANF numbers (~3,300 read /
+   1,100 write aligned) are ~4× lower than ours (~13,900 / 4,670) — shared pod
+   CPU/network and concurrent I/O contention. **Crucially, the ~3× cross-zone
+   *ratio* is identical in both labs**, which is the finding that matters. The
+   customer's aligned numbers land near *our* cross-zone numbers because
+   effective concurrency, not the zone, sets the absolute ceiling.
+2. **I/O engine — now closed (§3.6).** The customer's support-engineering data
+   splits results by `libaio` (async) vs `psync`/`posixaio` (sync), showing
+   async reaches multi-thousand IOPS on ANF and sync collapses to a few hundred
+   to ~1,500. Our §1–§3.5 runs used fio's default `psync` engine (synchronous,
    `iodepth` inert, ~3 in-flight ops by Little's Law) — fully consistent with
-   HCL's "sync" regime. We then **added an `--ioengine=libaio` variant and
-   re-ran it (§3.6)**: our Azure Files async result (**6,407 / 2,147 IOPS**)
-   matches HCL's ~6K/2K figure almost exactly, and ANF async reached ~24.7k
-   read on both zones. Same-to-same is now complete.
+   the customer's "sync" regime. We then **added an `--ioengine=libaio` variant
+   and re-ran it (§3.6)**: our Azure Files async result (**6,407 / 2,147 IOPS**)
+   matches the customer's ~6K/2K figure almost exactly, and ANF async reached
+   ~24.7k read on both zones. Same-to-same is now complete.
 
-### 0.5 The ask to the Product Group
+### Open ask to the engineering group
 
 1. **Confirm the per-volume small-block concurrency cap.** Across every
    combination we tested (2 TiB & 5 TiB, `nconnect` 8 & 16, iodepth 1–256,
    aligned & cross-zone), the volume serializes at **~3 outstanding 4 KiB
-   random ops** and leaves 80%+ of provisioned throughput idle. Is this an
+   random ops** and leaves 80 %+ of provisioned throughput idle. Is this an
    expected per-volume serialization limit on Premium / Auto QoS for small
    random I/O? Does Manual QoS or a larger block size lift it?
 2. **Confirm the cross-zone RTT budget.** We measure a constant ~450–500 µs
    added per I/O cross-zone in `westus3`. Is that the expected inter-AZ RTT,
    and is it consistent across regions?
-3. **Guidance for HA + performance together.** Since a single ANF volume
-   cannot be shared across zones without the 3× penalty, what is the
-   recommended pattern when the workload needs both zone-HA *and* aligned
-   IOPS? (We outline Cross-Zone Replication and per-zone-volume options in
-   §4.3 — we'd like PG validation.)
+3. **Guidance for HA + performance together.** Since a single ANF volume cannot
+   be shared across zones without the 3× penalty (in the sync regime), what is
+   the recommended pattern when the workload needs both zone-HA *and* aligned
+   IOPS? (We outline Cross-Zone Replication and per-zone-volume options in §4.3.)
 
-### 0.6 Recommended next step before/with PG engagement
+### Recommended next step
 
 The `--ioengine=libaio` same-to-same run is **done (§3.6)** and produced the
 most important nuance in this report (the async regime has no cross-zone
@@ -128,17 +200,9 @@ penalty). The remaining open item is small: **re-run the `libaio` variant on a
 (we expect ~60k read on both zones), and optionally a `bs=64k` pass. Neither
 changes the architecture guidance.
 
-> **One-line takeaway for the PG:** *We independently reproduced HCL's finding
-> with a key nuance. ANF's ~3× cross-zone penalty is real but **regime-specific**:
-> it hits **synchronous / shallow-queue** 4 KiB workloads (per-op inter-zone RTT
-> bound), and `nconnect`, iodepth, and capacity can't tune it away. But
-> **asynchronous deep-queue** I/O erases the penalty — both zones saturate the
-> same zone-independent provisioned-throughput ceiling (~128 MiB/s on 2 TiB).
-> So the right question for the customer's workload is: is it sync/latency-bound
-> (then zone-align the compute) or async/throughput-bound (then the zone doesn't
-> matter for IOPS)?*
-
 ---
+
+# Detailed diagnostics
 
 ## 1. Lab Setup
 
@@ -288,8 +352,8 @@ they let us correlate `Δlatency ≈ inter-zone RTT`.
 * **SMB** on Azure Files — blocked by tenant `allowSharedKeyAccess=false` policy.
   Same protocol comparison (NFS on both backends) is actually cleaner anyway.
 * **Volume size sweep** (2 / 3 / 5 TiB) — ANF Premium scales at 64 MiB/s per
-  TiB, but for 4 KiB random I/O this matters less than network latency.
-  Can be added later by changing the Bicep parameter.
+  TiB, but for 4 KiB random I/O this matters less than network latency (this
+  is later tested directly in §3.5).
 * **Other VM SKUs / accelerated networking variants** — current SKU
   (`D8s_v5`) has accelerated networking on by default; not the bottleneck.
 
@@ -419,10 +483,9 @@ single 4 KiB I/O.
 
 A second run was performed using the [run-followup-tests.sh](scripts/run-followup-tests.sh)
 harness, holding everything constant except the NFS mount option
-`nconnect`. The hypothesis (§4.6 in an earlier draft) was that doubling
-nconnect from 8 to 16 would roughly double cross-zone IOPS, because the
-cross-zone ceiling was modeled as *(NFS slots) ÷ RTT*. **The data does
-not support that hypothesis.**
+`nconnect`. The hypothesis was that doubling nconnect from 8 to 16 would
+roughly double cross-zone IOPS, because the cross-zone ceiling was modeled
+as *(NFS slots) ÷ RTT*. **The data does not support that hypothesis.**
 
 Dates: same 2026-06 lab, same 2 TiB Premium volume in Z1. vm-z3 was not
 included — vm-misaligned already established that Z2 and Z3 behave
@@ -519,9 +582,9 @@ The aligned side hits the same ceiling at ~3 outstanding I/Os too
 aligned — and slightly hurt it because the extra TCP connections add
 overhead without gaining throughput.
 
-This reframes the §4.1 Q4 / §4.6 wording: the per-volume concurrency is
-**the** ceiling. The aligned numbers are higher only because each of
-those ~3 in-flight ops completes ~3× faster (235 μs vs 715 μs).
+The per-volume concurrency is **the** ceiling. The aligned numbers are
+higher only because each of those ~3 in-flight ops completes ~3× faster
+(235 μs vs 715 μs).
 
 ### 3.5 Follow-up run: 5 TiB volume (vm-aligned and vm-misaligned)
 
@@ -608,13 +671,10 @@ $$ \text{IOPS}_{\text{aligned}} / \text{IOPS}_{\text{cross-zone}}
    \;\approx\; \text{RTT}_{\text{cross-zone}} / \text{RTT}_{\text{aligned}}
    \;\approx\; 3\times $$
 
-This falsifies the model used earlier in §4.1 / §4.2 / §4.6 that
-predicted *"5 TiB Premium ≈ ~35k IOPS aligned"* and a ratio that
-*"widens to ~8×"*. Both numbers were wrong. The aligned and
-cross-zone ceilings are set by the same per-volume concurrency cap;
-buying more capacity does **not** raise either one, at least for
-4 KiB random I/O on the Premium tier in Auto QoS. The 3× ratio is
-looking less like a floor and more like a constant — set entirely by
+The aligned and cross-zone ceilings are set by the same per-volume
+concurrency cap; buying more capacity does **not** raise either one, at
+least for 4 KiB random I/O on the Premium tier in Auto QoS. The 3× ratio
+is looking less like a floor and more like a constant — set entirely by
 the inter-zone RTT.
 
 > **Caveats on this finding.** The cap reported here is for 4 KiB
@@ -633,12 +693,13 @@ the inter-zone RTT.
 
 Every result above used fio's **default `psync` (synchronous)** engine, where
 `iodepth` is largely inert (one op in flight per job, so effective concurrency
-≈ `numjobs`). HCL's support-engineering data, by contrast, split results by
-`libaio` (async) vs `psync`/`posixaio` (sync). To be fully same-to-same with
-HCL's async figures, the [run-fio-tests.sh](scripts/run-fio-tests.sh) harness
-gained a third variant (`run_async`) using `--ioengine=libaio`, which lets
-`iodepth=64` keep all 64 ops genuinely in flight (256 outstanding with
-`numjobs=4`). Fresh 2 TiB Premium volume in Z1, `nconnect=8`, both VMs.
+≈ `numjobs`). The customer's support-engineering data, by contrast, split
+results by `libaio` (async) vs `psync`/`posixaio` (sync). To be fully
+same-to-same with the customer's async figures, the
+[run-fio-tests.sh](scripts/run-fio-tests.sh) harness gained a third variant
+(`run_async`) using `--ioengine=libaio`, which lets `iodepth=64` keep all 64
+ops genuinely in flight (256 outstanding with `numjobs=4`). Fresh 2 TiB Premium
+volume in Z1, `nconnect=8`, both VMs.
 
 #### 3.6a Results (4 KiB, 75/25 randrw, 4 jobs × iodepth=64, 60 s)
 
@@ -686,9 +747,9 @@ It also explains why §3.5's 5 TiB resize didn't help: those runs were `psync`
 would be expected to scale async IOPS up ~2.5× on **both** zones — a clean
 follow-up worth running.
 
-#### 3.6c Reconciling with HCL
+#### 3.6c Reconciling with the customer's data
 
-HCL's support-engineering numbers map cleanly onto this run:
+The customer's support-engineering numbers map cleanly onto this run:
 
 * **Azure Files Premium async ~6K/2K** → our Files `libaio` = **6,407 / 2,147**. Direct match.
 * **ANF async ~2× higher than Files** → our ANF `libaio` (~24.7k) is ~3–4×
@@ -709,7 +770,7 @@ and sees no zonal difference.
 
 ### 4.1 Direct answers to the five investigation questions
 
-**1. Is the reported "~3× cross-zone penalty" reproducible? → Yes, exactly — at this volume size.**
+**1. Is the reported "~3× cross-zone penalty" reproducible? → Yes, exactly — at this volume size, in the sync regime.**
 
 | Measurement | Aligned (Z1) | Cross-zone (Z2) | Cross-zone (Z3) | Penalty |
 |---|---|---|---|---|
@@ -720,7 +781,7 @@ The reported number is correct and not workload-specific or random noise.
 The gap is reproducible across 3 iterations, across two different
 non-zone-1 VMs, and across the entire iodepth sweep.
 
-> **Important caveat on "3×" — updated by §3.5.** The aligned
+> **Important caveat on "3×" — updated by §3.5 and §3.6.** The aligned
 > ~12k–14k read IOPS is a **per-volume concurrency ceiling** of about
 > 3 in-flight 4 KiB ops, not a provisioned-throughput ceiling and not a
 > network ceiling (the iodepth sweep is flat because the volume itself
@@ -737,7 +798,9 @@ non-zone-1 VMs, and across the entire iodepth sweep.
 > sensitive to volume size, `nconnect`, or iodepth. The thing that
 > **is** constant is the latency delta (~450–500 µs added per I/O
 > cross-zone) — that is the inter-zone RTT cost and the most defensible
-> number to quote when talking about the penalty in the abstract.
+> number to quote when talking about the penalty in the abstract. And
+> §3.6 shows the whole penalty is **specific to the sync regime** — it
+> disappears under `libaio`.
 
 **2. Is the penalty consistent across Zone 2 and Zone 3? → Yes, identical.**
 
@@ -766,10 +829,11 @@ The **IOPS ratio (3.31×) almost exactly matches the latency ratio (3.43×)**.
 That's the proof that this is a pure network-RTT effect — nothing to do
 with ANF's storage backend, NFS protocol, or the workload pattern.
 
-**4. At what iodepth does the gap close? → It does not close with iodepth, *and it does not close with `nconnect` either*.**
+**4. At what iodepth does the gap close? → It does not close with iodepth *under `psync`*, nor with `nconnect` — but it does close under `libaio` (§3.6).**
 
 This is the most subtle finding. The flat iodepth sweep shows that
-*application-side queue depth* does not close the gap:
+*application-side queue depth* does not close the gap under the synchronous
+engine:
 
 * Aligned: ~12k–14k IOPS at iodepth=1, same at iodepth=256
 * Cross-zone: ~4.1k IOPS at iodepth=1, same at iodepth=256
@@ -782,36 +846,39 @@ do not close it either:
 
 Little's Law on the cross-zone result gives ≈3 outstanding I/Os whether
 nconnect is 8 or 16, and the aligned side hits the same ~3-in-flight
-ceiling at ~235 μs per op. **The real ceiling is a service-side
-per-volume concurrency cap, not (client-slots ÷ RTT).** The aligned
-side is faster only because each of those ~3 slots completes ~3× faster
-thanks to the much lower RTT. So the gap is:
+ceiling at ~235 μs per op. **Under `psync`, the real ceiling is a
+service-side per-volume concurrency cap, not (client-slots ÷ RTT).** The
+aligned side is faster only because each of those ~3 slots completes ~3×
+faster thanks to the much lower RTT. So in the sync regime the gap is:
 
 > aligned_IOPS / cross_zone_IOPS ≈ cross_zone_RTT / aligned_RTT ≈ 3×
 
-at this volume size, and the only application-side knobs that move it
-are ones that **lower the RTT** — which means moving the compute into
-the ANF volume's zone.
+**However, §3.6 shows the gap *does* close once the I/O engine can keep a
+deep queue genuinely in flight.** Under `--ioengine=libaio` (256 ops
+outstanding), both zones converge on ~24.7k read IOPS — the bottleneck
+moves from per-op RTT to the volume's zone-independent provisioned
+throughput. So the complete answer is: queue depth closes the gap only
+when the engine is asynchronous.
 
-**5. Architecture recommendation → Co-locate compute with the ANF volume's zone.**
+**5. Architecture recommendation → Match the fix to the regime.**
 
-The cross-zone penalty is real, large (≥3× at this volume size),
-reproducible, and not eliminable from the application layer. The
-nconnect=16 follow-up confirmed the cross-zone leg gains only ~5 % from
-doubling the NFS transport slot count, because the service-side
-per-volume concurrency cap (~3 in-flight ops at this size) is reached
-long before client transport runs out. So the correct answer is
-still architectural: make sure latency-sensitive workloads run in the
-same zone as the ANF volume.
+* **Synchronous / latency-bound workloads** (single-threaded commits,
+  shallow-queue random I/O): the cross-zone penalty is real, large (≥3× at
+  this volume size), and not eliminable from the application layer.
+  **Co-locate compute with the ANF volume's zone.**
+* **Asynchronous / throughput-bound workloads** (deep-queue, pipelined I/O):
+  there is no cross-zone penalty — both zones saturate the same provisioned
+  throughput. Zone alignment does not affect IOPS; size the volume's
+  provisioned throughput instead.
 
 ### 4.2 Recommendations
 
 **For an AKS-based deployment of this workload:**
 
-1. **Set `topologySpreadConstraints` or a node affinity to pin pods to the
-   same zone as the ANF volume.** Use `topology.kubernetes.io/zone` as the
-   key. If pods land in a non-aligned zone, performance drops 3× —
-   exactly the symptom originally reported.
+1. **For sync/latency-bound workloads, set `topologySpreadConstraints` or a
+   node affinity to pin pods to the same zone as the ANF volume.** Use
+   `topology.kubernetes.io/zone` as the key. If pods land in a non-aligned
+   zone, sync performance drops 3× — exactly the symptom originally reported.
 2. **Confirm the ANF volume's zone** (look at `properties.zones` on the
    volume resource) and make at least one AKS node pool in that zone with
    enough capacity for the database workload.
@@ -825,38 +892,33 @@ same zone as the ANF volume.
 
 **For workloads that don't need ANF's IOPS:**
 
-* Azure Files NFS Premium delivered ~810 read IOPS — same on both zones.
-  That's ~3× below the cross-zone ANF number and ~17× below the aligned
-  ANF number. **For small, latency-tolerant shared file workloads, Azure
-  Files NFS is a simpler choice** with no zone-affinity tax.
-* The choice is therefore: ANF if you need >5,000 IOPS *and* you can
-  guarantee zone alignment; Azure Files NFS otherwise.
+* Azure Files NFS Premium delivered ~810 read IOPS (sync) — same on both
+  zones. **For small, latency-tolerant shared file workloads, Azure Files
+  NFS is a simpler choice** with no zone-affinity tax.
+* The choice is therefore: ANF if you need high IOPS *and* (for sync
+  workloads) you can guarantee zone alignment; Azure Files NFS otherwise.
 
 **Sizing implication for the original 2 / 3 / 5 TB question — revised by §3.5.**
 
-The original prediction in this section was that scaling to 5 TiB
-Premium would give *~35k read IOPS aligned* because the per-TiB
-throughput tier (64 MiB/s/TiB) implies a higher ceiling. **That
-prediction was tested in §3.5 and falsified.** Going from 2 TiB to
-5 TiB increased the volume's provisioned throughput from 128 MiB/s to
-320 MiB/s (Auto QoS, confirmed via the ARM API), but neither the
-aligned IOPS (~12k → ~12k) nor the cross-zone IOPS (~4.1k → ~4.3k) moved
-outside run-to-run noise. Both legs cap at ~3 in-flight 4 KiB ops per
-volume, leaving 80–85 % of the provisioned throughput unused on a 5 TiB
-volume.
+The original prediction was that scaling to 5 TiB Premium would give
+*~35k read IOPS aligned* because the per-TiB throughput tier
+(64 MiB/s/TiB) implies a higher ceiling. **That prediction was tested in
+§3.5 and falsified for the sync regime.** Going from 2 TiB to 5 TiB
+increased the volume's provisioned throughput from 128 MiB/s to 320 MiB/s
+(Auto QoS, confirmed via the ARM API), but neither the aligned IOPS
+(~12k → ~12k) nor the cross-zone IOPS (~4.1k → ~4.3k) moved outside
+run-to-run noise. Both legs cap at ~3 in-flight 4 KiB ops per volume,
+leaving 80–85 % of the provisioned throughput unused on a 5 TiB volume —
+**under the synchronous engine.** Under `libaio` (§3.6) the volume *does*
+consume its provisioned throughput, so capacity would be expected to scale
+async IOPS proportionally.
 
-The practical implication for 4 KiB random workloads on Premium with
-Auto QoS: **capacity sizing does not buy you small-block IOPS**.
-Buy capacity for the data you need to store; do not buy capacity
-expecting it to lift the random-IOPS ceiling. For workloads where
-`bs ≥ 64k` (i.e. MiB/s is the real constraint), capacity will matter
-again because provisioned throughput will be the binding cap.
-Cross-zone is still ~4k IOPS regardless of any of this. **Buying
-more ANF capacity does nothing to fix the cross-zone problem, and**
-(at the workload tested here) **does nothing to lift aligned 4 KiB
-random IOPS either.** Only zone-alignment moves the IOPS number;
-only a different QoS mode or block size would move the aligned
-ceiling.
+The practical implication for 4 KiB random sync workloads on Premium with
+Auto QoS: **capacity sizing does not buy you small-block IOPS**. Buy
+capacity for the data you need to store; do not buy capacity expecting it
+to lift the sync random-IOPS ceiling. For async workloads (or `bs ≥ 64k`
+where MiB/s is the real constraint), capacity will matter because
+provisioned throughput becomes the binding cap.
 
 ### 4.3 HA architecture options (when "spread across zones" is required)
 
@@ -865,14 +927,14 @@ raises the question: *if the workload needs zone-level HA, how do we get
 both performance and HA at the same time?* The short answer is that
 **HA on ANF cannot come from sharing one volume across zones** — the
 cross-zone penalty measured here is a property of inter-AZ RTT and is not
-tunable away. HA has to come from **replicating the data**. There are
-three patterns that work, summarised below.
+tunable away in the sync regime. HA has to come from **replicating the
+data**. There are three patterns that work, summarised below.
 
 **Why active-active across zones with a single ANF volume is not an
 option.** ANF volumes are inherently zonal (a zone is chosen at create
 time via Availability Zone Volume Placement); there is no regional or
 zone-redundant ANF volume. The NFS protocol is happy across zones, but
-every 4 KiB op pays the ~500 µs inter-zone RTT, which is exactly the
+every 4 KiB sync op pays the ~500 µs inter-zone RTT, which is exactly the
 3× drop we measured. So multi-zone HA must replicate the data into a
 separate volume in each consuming zone, not stretch one volume across
 zones.
@@ -1033,7 +1095,7 @@ disappear.
 * **Pattern C** often wins on TCO once the DBA hours are counted —
   prefer it whenever the workload is a supported managed engine.
 
-### 4.6 Limitations and future work
+### 4.5 Limitations and future work
 
 **1. `nconnect=16` on the cross-zone mount — DONE (§3.4).** The
 follow-up run quantified the effect of doubling `nconnect`. Result:
@@ -1042,7 +1104,7 @@ prediction (cross-zone IOPS roughly doubles, ratio tightens to ~1.7×)
 was **incorrect** — the cross-zone ceiling is a service-side per-volume
 concurrency cap (≈3 outstanding 4 KiB ops at this size, per Little's
 Law), not a client-side transport-slot cap. Raising `nconnect` cannot
-push past it. This is now the headline addition to the verdict.
+push past it in the sync regime.
 
 **2. Larger volume aligned, to show the ratio widens — DONE (§3.5),
 result was the opposite of the prediction.** The pool was resized
@@ -1052,33 +1114,39 @@ provisioned throughput from 128 MiB/s to 320 MiB/s. Aligned IOPS
 **did not change** (4,296 vs 4,134 — within 4 %), and the ratio
 **slightly narrowed** rather than widened. Little's Law gives the same
 ~3 in-flight ops on every combination of {2 TiB, 5 TiB} × {nconnect=8,
-16} × {aligned, cross-zone}. The per-volume concurrency cap is
-apparently the same at 5 TiB as at 2 TiB, at least for 4 KiB random I/O
-with `numjobs=4` on Premium / Auto QoS. Open question for further work:
+16} × {aligned, cross-zone} — under the sync engine. Open question:
 does the same cap apply under **Manual QoS**, or with **larger block
 sizes** (`bs=64k`, `bs=1m`) where throughput would actually become the
 binding constraint?
 
-**3. Azure Files NFS at `nconnect=8` for clean comparison — DONE.** The
+**3. Async engine (`libaio`) — DONE (§3.6).** Added an `--ioengine=libaio`
+variant; it erased the ANF cross-zone penalty entirely (~24.7k read on
+both zones) by shifting the bottleneck to the volume's zone-independent
+provisioned throughput. Remaining follow-up: re-run the async variant on
+a 5 TiB volume to confirm async IOPS scale ~2.5× with provisioned
+throughput (expected ~60k read on both zones), plus an optional `bs=64k`
+pass. Neither changes the architecture guidance.
+
+**4. Azure Files NFS at `nconnect=8` for clean comparison — DONE.** The
 earlier version of `setup-vm.sh` mounted Azure Files NFS at
 `nconnect=4` while ANF was at `nconnect=8`, which left the
 Files-vs-ANF comparison not strictly apples-to-apples. The script now
 uses `nconnect=8` for both. The previously published Files numbers
 (~810 read IOPS) should be re-validated under the new setting before
-being quoted as a clean comparison; this lab now uses the
-`run-followup-tests.sh` harness for ANF only, so the Files comparison
-is still on the original Test 1 / Test 2 numbers.
+being quoted as a clean comparison.
 
-### 4.5 Bottom line
+### 4.6 Bottom line
 
-> The original observation is correct. Azure NetApp Files Premium on a
-> 2 TiB volume delivers ~12k–14k random 4 KiB read IOPS at ~200–235 µs
-> latency when the client VM is in the same availability zone as the
-> volume, and drops to ~4k IOPS at ~700 µs latency when the client is in
-> any other zone. The cross-zone penalty is caused by Azure's inter-zone
-> RTT (~450–500 µs added per I/O). It is symmetric across all non-source
-> zones (Z2 ≈ Z3) and **cannot be removed** from the application layer.
-> Two follow-up hypotheses were tested and both falsified:
+> The original observation is correct **for synchronous, shallow-queue
+> workloads**. Azure NetApp Files Premium on a 2 TiB volume delivers
+> ~12k–14k random 4 KiB read IOPS at ~200–235 µs latency when the client
+> VM is in the same availability zone as the volume (sync engine), and
+> drops to ~4k IOPS at ~700 µs latency when the client is in any other
+> zone. The cross-zone penalty is caused by Azure's inter-zone RTT
+> (~450–500 µs added per I/O). It is symmetric across all non-source
+> zones (Z2 ≈ Z3) and **cannot be removed** from the application layer
+> while the workload stays synchronous. Two sync-regime fixes were tested
+> and both falsified:
 >
 > 1. **`nconnect=16` closes the gap (§3.4)** — false. Doubling NFS
 >    transport slots gained cross-zone only ~5 % and lost aligned ~4 %.
@@ -1089,9 +1157,9 @@ is still on the original Test 1 / Test 2 numbers.
 >    cross-zone unchanged at ~4.3k, with ~80 % of the new throughput
 >    sitting idle.
 >
-> The reason both fixes failed is that both ceilings sit at the same
-> service-side per-volume concurrency cap — about **3 in-flight 4 KiB
-> ops per volume**, by Little's Law, holding across every {2 TiB,
+> The reason both fixes failed is that, under `psync`, both ceilings sit
+> at the same service-side per-volume concurrency cap — about **3 in-flight
+> 4 KiB ops per volume**, by Little's Law, holding across every {2 TiB,
 > 5 TiB} × {nconnect=8, 16} × {aligned, cross-zone} combination tested.
 > Aligned is faster only because each of those ~3 ops completes ~3×
 > faster thanks to lower RTT. So
@@ -1100,11 +1168,20 @@ is still on the original Test 1 / Test 2 numbers.
 > \approx 3\times$ is essentially a **constant** of the inter-zone RTT
 > ratio, not a floor that widens with capacity.
 >
-> The fix is architectural: pin the compute to the ANF volume's zone,
-> or use per-zone ANF volumes with replication. Open question for
-> further work: whether **Manual QoS** or **larger block sizes**
-> (`bs=64k`) lift the per-volume concurrency cap and let the
-> provisioned throughput actually be consumed.
+> **The decisive nuance (§3.6): the penalty is regime-specific.** Switching
+> to an asynchronous deep-queue engine (`--ioengine=libaio`, 256 ops in
+> flight) **erased the cross-zone penalty entirely** — both zones delivered
+> ~24.7k read IOPS, bound by the volume's zone-independent provisioned
+> throughput rather than per-op RTT. Azure Files NFS, by contrast, was
+> zone-insensitive in **both** regimes.
+>
+> The fix is therefore regime-matched: for sync / latency-bound workloads,
+> pin the compute to the ANF volume's zone (or use per-zone ANF volumes
+> with replication); for async / throughput-bound workloads, the zone does
+> not matter for IOPS — size the provisioned throughput instead. Open
+> question for further work: whether **Manual QoS** or **larger block
+> sizes** (`bs=64k`) lift the per-volume concurrency cap in the sync
+> regime, and confirming async IOPS scale with capacity on a 5 TiB volume.
 
 ---
 
