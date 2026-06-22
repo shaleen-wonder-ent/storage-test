@@ -1,0 +1,50 @@
+# Static PersistentVolume + PVC for the Azure NetApp Files volume.
+#
+# We use a STATIC NFS PV (not the Trident / managed ANF CSI driver) on purpose:
+# it lets us set the exact same NFS mount options the VM lab used, so the AKS
+# numbers are apples-to-apples with Storage-CrossZone-Findings.md. The
+# __ANF_MOUNT_IP__ / __ANF_MOUNT_PATH__ placeholders are substituted by
+# scripts/run-aks-tests.sh from the Bicep deployment outputs.
+#
+# To compare against what the managed ANF CSI driver actually sets for
+# nconnect/rsize/wsize, deploy a Trident/managed-CSI StorageClass alongside
+# this and run scripts/inspect-mount.sh against both (see README §"CSI
+# mount-option fidelity").
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: anf-static-pv
+  labels:
+    lab: anf-static
+spec:
+  capacity:
+    storage: 2Ti
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  mountOptions:
+    - vers=4.1
+    - sec=sys
+    - nconnect=8
+    - rsize=262144
+    - wsize=262144
+    - hard
+    - timeo=600
+    - retrans=2
+  nfs:
+    server: __ANF_MOUNT_IP__
+    path: /__ANF_MOUNT_PATH__
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: anf-pvc
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: ""
+  volumeName: anf-static-pv
+  resources:
+    requests:
+      storage: 2Ti

@@ -1,0 +1,74 @@
+# fio runner script shared by both Jobs (aligned and cross-zone).
+# Mirrors scripts/run-fio-tests.sh from the VM lab, single-mount (ANF at
+# /mnt/netapp), and prints the node/zone it actually landed on so results are
+# self-labelling. Runs three variants: burst (psync), sustained 60s (psync),
+# and async 60s (libaio) — the libaio run is the one that erases the
+# cross-zone penalty in the VM lab (see Storage-CrossZone-Findings.md §3.6).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fio-runner
+data:
+  run.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    MOUNT=/mnt/netapp
+    FILEDIR="${MOUNT}/storage"
+    mkdir -p "$FILEDIR"
+
+    echo "=========================================================="
+    echo "  AKS fio run  ($(date -u +%FT%TZ))"
+    echo "  Pod:   ${HOSTNAME}"
+    echo "  Node:  ${NODE_NAME:-unknown}"
+    echo "  Zone:  ${NODE_ZONE:-unknown}   (lab-role=${LAB_ROLE:-unknown})"
+    echo "=========================================================="
+
+    echo "==> Installing fio + nfs tooling"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y -qq fio nfs-common >/dev/null
+
+    echo
+    echo "==> Actual NFS mount options seen by this pod (CSI fidelity check):"
+    nfsstat -m || mount | grep -E "$MOUNT" || true
+    echo
+
+    run_burst() {
+      local file="${FILEDIR}/rrw.fio"; rm -f "$file"
+      echo "--- Burst (75/25 randrw, 4k, iodepth=64, size=1M, psync) ---"
+      fio --randrepeat=1 --direct=1 --gtod_reduce=1 --name=test \
+          --filename="$file" --bs=4k --iodepth=64 --size=1M \
+          --readwrite=randrw --rwmixread=75 | grep -E 'IOPS|BW='
+      echo
+    }
+
+    run_sustained() {
+      local file="${FILEDIR}/rrw_sustained.fio"; rm -f "$file"
+      echo "--- Sustained (75/25 randrw, 4k, iodepth=64, 60s, 4 jobs, psync) ---"
+      fio --randrepeat=1 --direct=1 --gtod_reduce=1 --name=sustained \
+          --filename="$file" --bs=4k --iodepth=64 \
+          --size=4G --runtime=60 --time_based \
+          --numjobs=4 --group_reporting \
+          --readwrite=randrw --rwmixread=75 | grep -E 'IOPS|BW='
+      echo
+    }
+
+    run_async() {
+      local file="${FILEDIR}/rrw_async.fio"; rm -f "$file"
+      echo "--- Async (75/25 randrw, 4k, iodepth=64, 60s, 4 jobs, libaio) ---"
+      fio --randrepeat=1 --direct=1 --ioengine=libaio --name=async \
+          --filename="$file" --bs=4k --iodepth=64 \
+          --size=4G --runtime=60 --time_based \
+          --numjobs=4 --group_reporting \
+          --readwrite=randrw --rwmixread=75 | grep -E 'IOPS|BW=|lat \(usec\)|lat \(msec\)'
+      echo
+    }
+
+    run_burst
+    run_sustained
+    run_async
+
+    echo "=========================================================="
+    echo "  Done — Pod ${HOSTNAME} on node ${NODE_NAME:-unknown} (zone ${NODE_ZONE:-unknown})"
+    echo "=========================================================="

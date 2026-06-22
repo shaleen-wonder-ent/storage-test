@@ -1,0 +1,46 @@
+# Aligned fio Job — pinned to the node pool in the SAME zone as the ANF volume.
+# This is the best-case baseline (expected ~12k-14k read IOPS psync).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fio-aligned
+spec:
+  backoffLimit: 0
+  completions: 1
+  template:
+    metadata:
+      labels:
+        lab: fio
+        lab-role: aligned
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        lab-role: aligned
+      containers:
+        - name: fio
+          image: ubuntu:24.04
+          command: [ "/bin/bash", "/scripts/run.sh" ]
+          env:
+            - name: LAB_ROLE
+              value: "aligned"
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: anf
+              mountPath: /mnt/netapp
+            - name: runner
+              mountPath: /scripts
+          resources:
+            requests:
+              cpu: "2"
+              memory: 2Gi
+      volumes:
+        - name: anf
+          persistentVolumeClaim:
+            claimName: anf-pvc
+        - name: runner
+          configMap:
+            name: fio-runner
+            defaultMode: 0755

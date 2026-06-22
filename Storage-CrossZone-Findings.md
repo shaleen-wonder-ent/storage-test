@@ -150,7 +150,7 @@ asynchronous / deep-queue I/O.
 | Tool | FIO | FIO | ✅ |
 | Workload | 4 KiB, 75/25 randrw, `size=1M`, `direct=1`, `iodepth=64` | **Identical command** | ✅ |
 | Backends | Azure Files SMB + NFS, ANF NFS | Same 3 (SMB blocked by our tenant policy) | ✅ ⚠️SMB |
-| Compute | AKS pod, 3 mounts in **one pod, run in parallel** | 3 VMs (Z1/Z2/Z3), mounts run **isolated per backend** | ⚠️ see note |
+| Compute | AKS pod, 3 mounts in **one pod, run in parallel** | 3 VMs (Z1/Z2/Z3), mounts run **isolated per backend** — **plus an AKS re-run (§3.7)** | ✅ closed |
 | AZ variation | AKS node pools across AZs | VMs in Z1/Z2/Z3 vs ANF in Z1 | ✅ |
 | VM SKU sensitivity | Tested → no impact | Confirmed → no impact | ✅ |
 | I/O engine | libaio (async) **and** psync/posixaio (sync) | psync **and** libaio (added §3.6) | ✅ closed |
@@ -763,6 +763,75 @@ penalty appears at all.** A latency-sensitive, low-concurrency workload (e.g.
 single-threaded synchronous commits) sees the full ~3× cross-zone hit; a
 throughput-oriented, deeply-pipelined workload saturates the volume ceiling
 and sees no zonal difference.
+
+---
+
+### 3.7 Follow-up run: AKS platform validation — reproduced on the customer's platform
+
+Every run in §3.1–§3.6 used standalone VMs to isolate the network variable.
+The customer, however, runs **AKS pods**, not VMs. To close the last
+same-to-same gap (compute platform) and to confirm the finding survives the
+extra AKS layers — pod scheduling, a kubelet-mounted `PersistentVolume`, and
+zone-aware node pools — the entire experiment was re-run on a dedicated AKS
+cluster. The lab is in [aks-lab/](aks-lab/README.md).
+
+#### 3.7a Setup
+
+| Element | Value |
+|---|---|
+| Cluster | `iopsaks-aks`, AKS v1.34.8, Azure CNI **overlay** |
+| Node pools | `alignpool` (1 × `Standard_D8s_v5`, **westus3-1** = ANF zone), `crosspool` (1 × `D8s_v5`, **westus3-2**) |
+| Volume | Same 2 TiB Premium NFSv4.1 ANF volume, pinned to **zone 1** |
+| Mount | **Static NFS `PersistentVolume`** with explicit `mountOptions` matching the VM lab (so it is apples-to-apples, not at the mercy of a CSI driver's defaults) |
+| Workload | Identical fio — 4 KiB, 75/25 randrw, `iodepth=64`; burst (psync), sustained (psync, 4 jobs, 60 s), async (`libaio`, 4 jobs, 60 s) |
+| Scheduling | Two fio `Job`s, each pinned to one pool via `nodeSelector: lab-role` |
+
+**Mount-fidelity check (the AKS-specific risk).** Both pods independently
+confirmed the volume mounted with the intended options — identical to the VM
+lab:
+
+```
+vers=4.1,rsize=262144,wsize=262144,hard,proto=tcp,nconnect=8,timeo=600,retrans=2,sec=sys
+```
+
+This matters because, in production, ANF is usually mounted through a CSI
+driver (Astra Trident / the managed ANF CSI driver) via dynamic provisioning,
+and those drivers **may not set `nconnect`** unless told to. The static PV here
+removes that variable; the takeaway is that **the AKS mount path can match the
+VM baseline exactly — but only when the mount options are set deliberately.**
+
+#### 3.7b Results (AKS pods, ANF, 4 KiB 75/25 randrw)
+
+| Variant | Aligned pod — zone 1 (read / write IOPS) | Cross-zone pod — zone 2 (read / write IOPS) | Cross-zone penalty |
+|---|---|---|---|
+| Burst (psync, `size=1M`) | 3,327 / 1,086 | 974 / 318 | **~3.4×** |
+| Sustained (psync, 4 jobs, 60 s) | **12,500 / 4,184** | **3,848 / 1,288** | **~3.25×** |
+| Async (`libaio`, 4 jobs, 60 s) | **24,700 / 8,271** | **24,700 / 8,276** | **1.00× (none)** |
+
+#### 3.7c What this confirms
+
+* **The penalty reproduces on AKS, unchanged.** The sustained psync penalty is
+  **~3.25×** (12,500 → 3,848 read), essentially identical to the VM lab's ~3×.
+  The async `libaio` penalty is **zero** — both pods delivered ~24.7k read /
+  ~8.3k write, the same zone-independent provisioned-throughput ceiling the VMs
+  hit. **The AKS layers add no new behaviour**; the finding is a property of the
+  storage + network, not the compute platform.
+* **Zone-aligning the pod is the fix, and it works end-to-end.** Pinning the
+  workload to a node pool in the ANF zone (`alignpool` in westus3-1) restored
+  full aligned IOPS through the pod → PV → NFS path. This validates the §4.2
+  remediation on the platform the customer actually runs.
+* **The numbers land on the VM aligned baseline, not the customer's lower
+  absolute figures**, because — like the VM lab — each fio target ran in
+  isolation. The customer's lower absolute numbers come from driving three
+  mounts concurrently in one pod (shared pod CPU/network), which lowers the
+  absolute ceiling without changing the ~3× cross-zone ratio (see the
+  same-to-same note above).
+
+> **AKS one-liner:** *Re-running the exact experiment on AKS — zone-pinned node
+> pools, a kubelet-mounted PV, identical fio — reproduces the ~3.25× sync
+> cross-zone penalty and the zero async penalty exactly. The cross-zone effect
+> is a storage/network property; the compute platform (VM vs AKS pod) does not
+> change it, and zone-aligning the pod fixes it.*
 
 ---
 

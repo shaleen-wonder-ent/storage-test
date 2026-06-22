@@ -1,0 +1,13 @@
+{
+  "resourceGroup": "rg-storage-iops-aks",
+  "location": "westus3",
+  "aksClusterName": "iopsaks-aks",
+  "nodeResourceGroup": "MC_rg-storage-iops-aks_iopsaks-aks_westus3",
+  "alignedZone": "1",
+  "crossZone": "2",
+  "nfsAccount": "iopsaksnfsjbkkd3hfopzui",
+  "nfsShare": "storage",
+  "nfsHost": "iopsaksnfsjbkkd3hfopzui.file.core.windows.net",
+  "anfMountIp": "10.50.2.4",
+  "anfMountPath": "vol1"
+}

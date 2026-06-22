@@ -1,0 +1,49 @@
+# Cross-zone fio Job — pinned to the node pool in a DIFFERENT zone than the
+# ANF volume. This is the worst-case test (expected ~4k read IOPS psync,
+# ~3x below aligned). Under the libaio variant the gap should close (both
+# legs saturate the volume's provisioned throughput) — see
+# Storage-CrossZone-Findings.md §3.6.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fio-crosszone
+spec:
+  backoffLimit: 0
+  completions: 1
+  template:
+    metadata:
+      labels:
+        lab: fio
+        lab-role: crosszone
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        lab-role: crosszone
+      containers:
+        - name: fio
+          image: ubuntu:24.04
+          command: [ "/bin/bash", "/scripts/run.sh" ]
+          env:
+            - name: LAB_ROLE
+              value: "crosszone"
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: anf
+              mountPath: /mnt/netapp
+            - name: runner
+              mountPath: /scripts
+          resources:
+            requests:
+              cpu: "2"
+              memory: 2Gi
+      volumes:
+        - name: anf
+          persistentVolumeClaim:
+            claimName: anf-pvc
+        - name: runner
+          configMap:
+            name: fio-runner
+            defaultMode: 0755
