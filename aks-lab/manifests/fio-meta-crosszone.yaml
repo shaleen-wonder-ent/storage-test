@@ -1,0 +1,49 @@
+# Cross-zone METADATA fio Job — pinned to the node pool in a DIFFERENT zone
+# than the ANF volume. Worst-case test for the metadata path. If a
+# metadata-heavy workload is latency-bound (serialized small round-trips),
+# expect a cross-zone drop in the same ballpark as the data-path ~3x penalty.
+# Compare ops/sec + latency against fio-meta-aligned.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fio-meta-crosszone
+spec:
+  backoffLimit: 0
+  completions: 1
+  template:
+    metadata:
+      labels:
+        lab: fio-meta
+        lab-role: crosszone
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        lab-role: crosszone
+      containers:
+        - name: fio
+          image: ubuntu:24.04
+          command: [ "/bin/bash", "/scripts/run.sh" ]
+          env:
+            - name: LAB_ROLE
+              value: "crosszone"
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: anf
+              mountPath: /mnt/netapp
+            - name: runner
+              mountPath: /scripts
+          resources:
+            requests:
+              cpu: "2"
+              memory: 2Gi
+      volumes:
+        - name: anf
+          persistentVolumeClaim:
+            claimName: anf-pvc
+        - name: runner
+          configMap:
+            name: fio-meta-runner
+            defaultMode: 0755

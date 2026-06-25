@@ -1,0 +1,87 @@
+# Metadata-heavy fio runner shared by both metadata Jobs (aligned and cross-zone).
+#
+# WHY THIS EXISTS:
+#   The existing fio-runner (rrw.fio, single file, 4k randrw) is pure DATA I/O
+#   and barely touches metadata. The Azure Files PG identified the customer's
+#   real bottleneck as METADATA, not IOPS. This runner drives the metadata
+#   path explicitly (Create / Open / Close / Stat / Delete across many small
+#   files) so we can measure:
+#     1. the metadata throughput of ANF through the AKS/NFS mount path, and
+#     2. whether a metadata-heavy workload shows the same ~3x cross-zone
+#        penalty that the data-path test does (aligned vs cross-zone pods).
+#
+# It mirrors scripts/run-metadata-tests.sh from the repo root, single-mount
+# (ANF at /mnt/netapp), and self-labels the node/zone it landed on.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fio-meta-runner
+data:
+  run.sh: |
+    #!/usr/bin/env bash
+    # NOTE: intentionally NOT using `set -e`/`pipefail`. NFS leaves silly-rename
+    # (.nfsXXXX) temp files so `rm -rf` of a phase dir can return non-zero, and
+    # `fio | grep | head` can SIGPIPE. Either would abort the run mid-way under
+    # `set -e`. We want all four phases to always run and report.
+    set -u
+
+    MOUNT=/mnt/netapp
+    BASEDIR="${MOUNT}/meta"
+    NFILES=${NFILES:-12000}
+    NUMJOBS=${NUMJOBS:-4}
+    RUNTIME=${RUNTIME:-60}
+
+    echo "=========================================================="
+    echo "  AKS METADATA fio run  ($(date -u +%FT%TZ))"
+    echo "  Pod:   ${HOSTNAME}"
+    echo "  Node:  ${NODE_NAME:-unknown}   (lab-role=${LAB_ROLE:-unknown})"
+    echo "  files/job=${NFILES}  jobs=${NUMJOBS}  read-churn=${RUNTIME}s"
+    echo "=========================================================="
+
+    echo "==> Installing fio + nfs tooling"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y -qq fio nfs-common >/dev/null
+
+    echo
+    echo "==> Actual NFS mount options seen by this pod (CSI fidelity check):"
+    nfsstat -m || mount | grep -E "$MOUNT" || true
+    echo
+
+    # Run one fio metadata phase, then echo the headline lines. Fully guarded:
+    # fio output is captured to a file (no SIGPIPE), and rm never aborts the run.
+    _run() {
+      local test=$1 dir=$2; shift 2
+      rm -rf "$dir" 2>/dev/null || true
+      mkdir -p "$dir"
+      echo "--- [$test] (nrfiles=${NFILES} x numjobs=${NUMJOBS}) ---"
+      local outf="/tmp/${test}.fio.out"
+      if ! fio --name="$test" --directory="$dir" \
+          --nrfiles="$NFILES" --numjobs="$NUMJOBS" --group_reporting \
+          "$@" > "$outf" 2>&1; then
+        echo "(fio returned non-zero for $test; headline lines below if any)"
+      fi
+      grep -E 'IOPS=|lat \(usec\)|lat \(msec\)' "$outf" | head -n 6 || true
+      rm -rf "$dir" 2>/dev/null || true
+      echo
+    }
+
+    # CREATE: open(O_CREAT)+close per file -> Create + Close.
+    _run "create"    "${BASEDIR}/create"    --ioengine=filecreate --filesize=4k
+
+    # STAT: stat() per file -> Open / lookup / getattr.
+    _run "stat"      "${BASEDIR}/stat"      --ioengine=filestat --filesize=4k
+
+    # READ CHURN: open + 4k read + close across many small files with a bounded
+    # working set of open FDs. Closest match to the WebSphere "read this small
+    # cache file and render it" pattern.
+    _run "readchurn" "${BASEDIR}/read"      --ioengine=psync --rw=randread \
+         --bs=4k --filesize=4k --file_service_type=random --openfiles=64 \
+         --runtime="$RUNTIME" --time_based --direct=0
+
+    # DELETE: unlink() per file -> Delete.
+    _run "delete"    "${BASEDIR}/delete"    --ioengine=filedelete --filesize=4k
+
+    echo "=========================================================="
+    echo "  Done — Pod ${HOSTNAME} on node ${NODE_NAME:-unknown} (lab-role=${LAB_ROLE:-unknown})"
+    echo "=========================================================="

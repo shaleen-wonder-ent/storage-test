@@ -1,0 +1,49 @@
+# Aligned METADATA fio Job — pinned to the node pool in the SAME zone as the
+# ANF volume. Best-case baseline for the metadata path (Create/Open/Stat/
+# Close/Delete). Compare its ops/sec + latency against fio-meta-crosszone to
+# see whether a metadata-heavy workload shows the same ~3x cross-zone penalty
+# as the data-path test.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fio-meta-aligned
+spec:
+  backoffLimit: 0
+  completions: 1
+  template:
+    metadata:
+      labels:
+        lab: fio-meta
+        lab-role: aligned
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        lab-role: aligned
+      containers:
+        - name: fio
+          image: ubuntu:24.04
+          command: [ "/bin/bash", "/scripts/run.sh" ]
+          env:
+            - name: LAB_ROLE
+              value: "aligned"
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: anf
+              mountPath: /mnt/netapp
+            - name: runner
+              mountPath: /scripts
+          resources:
+            requests:
+              cpu: "2"
+              memory: 2Gi
+      volumes:
+        - name: anf
+          persistentVolumeClaim:
+            claimName: anf-pvc
+        - name: runner
+          configMap:
+            name: fio-meta-runner
+            defaultMode: 0755
